@@ -25,7 +25,7 @@
 from rocisa import rocIsa, countInstruction, countGlobalRead, \
             countLocalRead, countLocalWrite, countDSStoreB256, getMFMAs
 from rocisa.code import Module, TextBlock, StructuredModule, KernelBody
-from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer
+from rocisa.container import RegisterContainer, replaceHolder, HWRegContainer, ContinuousRegister
 from rocisa.label import LabelManager
 from rocisa.asmpass import rocIsaPass, rocIsaPassOption
 from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
@@ -36,7 +36,9 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, \
+  SAddU32, SCmpGeU32, SCSelectB32
+from rocisa.functions import scalarStaticDivideAndRemainder
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType
 
@@ -3510,35 +3512,86 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if kernel["NumWaveSplitK"] > 1:
       module.add(self.waveSplitKReduction(kernel))
 
-    ####################################
-    # LocalSplitU reduction
-    ####################################
-    #if kernel["NumThreads"]%kernel["MacroTile0"] == 0:
-    if kernel["LocalSplitU"] > 1:
-      module.addComment1("LocalSplitU: local write and read")
-      lsuComponent = Component.LSU.find(self)
-      module.add(lsuComponent.writeReadReduction(self, kernel))
+    ##############################################################################
+    # selectStoreVectorWidth
+    # tmpSgpr must have at least 4 free SGPR
+    # svwTarget is the branch target if Size0 % storeVectorWidth > 0
+    ##############################################################################
+    def selectStoreVectorWidth(self, kernel, tmpSgprInfo, storeVectorWidth, svwTarget):
+      assert(isinstance(svwTarget, Label))
+      module = Module("selectStoreVectorWidth")
+      tmpS0  = tmpSgprInfo.idx
+      tmpS1  = tmpS0 + 1
+      tmpS23 = tmpS1 + 1
 
-      # LocalSplitU: global write indices
-      module.addComment1("LocalSplitU: global write indices")
-      module.add(lsuComponent.globalWriteIndices(self, kernel))
+      wg0="WorkGroup0"
 
-      # LocalSplitU: global write
-      module.addComment1("LocalSplitU: global write")
-      module.add(lsuComponent.globalWrite(self, kernel, tensorParametersA, tensorParametersB))
+      # s23 = rSVW = Size0 % storeVectorWidth
+      #--
+      sizeBoundary = [0,0]
+      sizeBoundary[0] = \
+          sgpr("PackedSize0") if len(kernel["PackedC0IndicesX"]) > 1 \
+          else self.sizeRef(kernel["ProblemType"]["Index0"])
 
+      module.add(scalarStaticDivideAndRemainder(tmpS1, tmpS0, sizeBoundary[0], storeVectorWidth, \
+        ContinuousRegister(tmpS23, 2), 2))
+      # s23 = nwg0-1
+      module.add(SAddU32(dst=sgpr(tmpS1), src0=hex(-1), src1=sgpr("NumWorkGroups0")))
+      module.add(SCmpGeU32(src0=sgpr(wg0), src1=sgpr(tmpS1), comment="wg0 >= nwg0-1 ?"))
+      module.add(SCSelectB32(dst=sgpr(tmpS0), src0=sgpr(tmpS0), src1=0, comment="set rSVW"))
+      # s01 now = mySVW = wg0 < nwg0-1 ? SVW : rSVW
+
+      module.add(self.getSCMPKInstruction("GTU32", tmpS0, 0, comment="rSVW > 0"))
+      module.add(self.longBranchScc1(svwTarget, posNeg=1, tmpSgprInfo=tmpSgprInfo, comment="jump if edges required"))
+
+    def doGlobalWrite():
+      ####################################
+      # LocalSplitU reduction
+      ####################################
+      #if kernel["NumThreads"]%kernel["MacroTile0"] == 0:
+      if kernel["LocalSplitU"] > 1:
+        module.addComment1("LocalSplitU: local write and read")
+        lsuComponent = Component.LSU.find(self)
+        module.add(lsuComponent.writeReadReduction(self, kernel))
+
+        # LocalSplitU: global write indices
+        module.addComment1("LocalSplitU: global write indices")
+        module.add(lsuComponent.globalWriteIndices(self, kernel))
+
+        # LocalSplitU: global write
+        module.addComment1("LocalSplitU: global write")
+        module.add(lsuComponent.globalWrite(self, kernel, tensorParametersA, tensorParametersB))
+
+      else:
+        ####################################
+        # NOT LocalSplitU
+        ####################################
+
+        # global write indices
+        module.addComment1("not-LocalSplitU: global write indices")
+        module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
+
+        # global write
+        module.addComment1("not-LocalSplitU: global write")
+        module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+
+    if kernel["AdaptiveGemm"] == 0:
+      doGlobalWrite()
     else:
-      ####################################
-      # NOT LocalSplitU
-      ####################################
-
-      # global write indices
-      module.addComment1("not-LocalSplitU: global write indices")
-      module.add(self.notLocalSplitUGlobalWriteIndices(kernel))
-
-      # global write
-      module.addComment1("not-LocalSplitU: global write")
-      module.add(self.notLocalSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+      originalSvw = kernel["StoreVectorWidth"]
+      svw = originalSvw
+      svws = list()
+      while svw > 0:
+        svws.append([svw, Label("GW_SVW%s"%svw, "Global Write Vector Width %s"%svw)])
+        svw = int(svw / 2) # decrease svw by half
+      for idxSvw in range(len(svws) - 1):
+        with self.allocTmpSgpr(4) as tmpSgprInfo:
+          selectStoreVectorWidth(self, kernel, tmpSgprInfo, svws[idxSvw][0], svws[idxSvw][1])
+      for idxSvw in range(len(svws)):
+        module.add(svws[idxSvw][1])
+        kernel["StoreVectorWidth"] = svws[idxSvw][0]
+        doGlobalWrite()
+      kernel["StoreVectorWidth"] = originalSvw
 
     module.add(self.functionEnd(kernel, addLabel=True))
 
