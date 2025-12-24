@@ -1198,6 +1198,10 @@ class Solution(collections.abc.Mapping):
       state["NonTemporalD"] = state["NonTemporal"]
       state["NonTemporalMetadata"] = state["NonTemporal"]
 
+    # force ntab
+    state["NonTemporalA"] = 0
+    state["NonTemporalB"] = 0
+
     # Init vars early since there are early-exit return statements below
     state["DirectToLdsA"] = False
     state["DirectToLdsB"] = False
