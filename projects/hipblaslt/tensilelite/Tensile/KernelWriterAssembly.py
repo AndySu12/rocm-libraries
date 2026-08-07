@@ -78,7 +78,7 @@ from .Components.GL2Prefetch import GL2PrefetchLoad
 from .Components.GlobalWriteBatch import GlobalWriteBatchWriter
 from .KernelWriterModules import *
 from .AsmMemoryHelpers import dsStore, dsLoad, _vgprOffset
-from .SolutionStructs import isPackedIndex
+from .SolutionStructs import isPackedIndex, decouplePgrBlocks, decoupledSingleBuffered
 from .AsmStoreState import StoreState, VectorDataTypes
 from .Activation import ActivationType
 from .CustomKernels import isCustomKernelConfig
@@ -5865,10 +5865,17 @@ class KernelWriterAssembly(KernelWriter):
           # needed for the VReadfirstlaneB32 in the prior code block
           if self.states.archCaps["CrosslaneWait"]:
             module.add(SNop(waitState=0, comment="1 wait states"))
-          module.add(SAddU32(dst=sgpr("Swap%s"%tc), src0=sgpr("LocalWriteAddr%s"%tc), src1=kernel["LdsOffsetA_Blk"], comment="Calculate starting lds addr of second buffer"))
+          # (LWA + stride) ^ LWA is a two-state toggle for any stride, so the
+          # packed per-tensor stride needs no idiom change here, only the right
+          # number: each tensor's second copy sits its own distance away.
+          _lwaBlk = self._decoupledSwapStride(kernel, tc) if self._dcpDivergent(kernel) \
+                    else kernel["LdsOffsetA_Blk"]
+          module.add(SAddU32(dst=sgpr("Swap%s"%tc), src0=sgpr("LocalWriteAddr%s"%tc), src1=_lwaBlk, comment="Calculate starting lds addr of second buffer"))
           module.add(SXorB32(dst=sgpr("Swap%s"%tc), src0=sgpr("Swap%s"%tc), src1=sgpr("LocalWriteAddr%s"%tc), comment="xor both lds buffer offsets to enable swapping"))
       else:
-        module.add(VAddU32(dst=vgpr("LocalWriteSwapAddr%s"%tc), src0=kernel["LdsOffsetA_Blk"], src1=vgpr("LocalWriteAddr%s"%tc), \
+        _lwaBlk = self._decoupledSwapStride(kernel, tc) if self._dcpDivergent(kernel) \
+                  else kernel["LdsOffsetA_Blk"]
+        module.add(VAddU32(dst=vgpr("LocalWriteSwapAddr%s"%tc), src0=_lwaBlk, src1=vgpr("LocalWriteAddr%s"%tc), \
                            comment="starting lds addr of second buffer" ))
         module.add(VXorB32(dst=vgpr("LocalWriteSwapAddr%s"%tc), \
                           src0=vgpr("LocalWriteSwapAddr%s"%tc), \
@@ -6139,7 +6146,9 @@ class KernelWriterAssembly(KernelWriter):
 
     tc = tP["tensorChar"]
     if kernel["StoreSwapAddr"]:
-      module.add(VAddU32(dst=vgpr("LocalReadSwapAddr%s"%tc), src0=kernel["LdsOffsetA_Blk"], src1=vgpr("LocalReadAddr%s"%tc), \
+      _lrSwapBlk = self._decoupledSwapStride(kernel, tc) if self._dcpDivergent(kernel) \
+                   else kernel["LdsOffsetA_Blk"]
+      module.add(VAddU32(dst=vgpr("LocalReadSwapAddr%s"%tc), src0=_lrSwapBlk, src1=vgpr("LocalReadAddr%s"%tc), \
                          comment="Calculate starting lds addr of second buffer" ))
       module.add(VXorB32(dst=vgpr("LocalReadSwapAddr%s"%tc), \
                          src0=vgpr("LocalReadSwapAddr%s"%tc), \
@@ -8003,9 +8012,12 @@ class KernelWriterAssembly(KernelWriter):
       loopCounter = self.loopCounter(kernel, loopIdx)
       module.addComment1("closeLoop loop%s finalLoop=%d tailLoop=%d" % (loopChar, finalLoop, tailLoop))
 
-      if kernel["enableTDMA"] and kernel["enableTDMB"] and not kernel["PrefetchGlobalRead"]:
-        module.add(SWaitCnt(dscnt=0, comment="TDM PGR=0: wait all ds_reads before TDM overwrite"))
-        module.add(SBarrier(comment="TDM PGR=0: signal+wait done reading LDS"))
+      if kernel["enableTDMA"] and kernel["enableTDMB"] and \
+         (not kernel["PrefetchGlobalRead"] or decoupledSingleBuffered(kernel)):
+        # Name the trigger that fired so legacy PGR=0 output stays byte-identical.
+        warWhy = "PGR=0" if not kernel["PrefetchGlobalRead"] else "single LDS blk"
+        module.add(SWaitCnt(dscnt=0, comment=f"TDM {warWhy}: wait all ds_reads before TDM overwrite"))
+        module.add(SBarrier(comment=f"TDM {warWhy}: signal+wait done reading LDS"))
 
       # If PrefetchGlobalRead=1 the loads in the loop prefetch next macro-tile
       # For the final trip through the unroll loop we need to ensure those loads stay in bounds.
@@ -11857,6 +11869,121 @@ class KernelWriterAssembly(KernelWriter):
 
     return imod
 
+  # Group membership for the decoupled-PGR LDS layout: group A is [A | MXSA] with
+  # stride LdsOffsetBlkA, group B is [MXSB | Metadata | B] with stride
+  # LdsOffsetBlkB. The groups can hold different numbers of copies, so no single
+  # delta describes both.
+  _tdmDecoupledGroup = {"A": "A", "MXSA": "A", "B": "B", "MXSB": "B", "Metadata": "B"}
+  # With NumWaves > 1 the B/MXSB descriptors are RegSet aliases of A/MXSA, so one
+  # physical descriptor serves both and only the A/MXSA call sites are reached.
+  _tdmDecoupledAliasPartner = {"A": "B", "MXSA": "MXSB"}
+
+  def _dcpDivergent(self, kernel):
+    """True only when A and B carry different LDS block counts.
+
+    Always False in a shipping configuration: Solution.py rejects divergent
+    counts. Every path guarded by this predicate -- the decoupled TDM swap, the
+    per-tensor swap strides at the four addressing sites -- is therefore
+    unreachable, and is kept as the basis for AIHPBLAS-4159 rather than deleted.
+
+    With equal counts the layout degenerates to legacy's copy-grouped single
+    power-of-two stride, so the legacy emit shape is not merely acceptable, it
+    is required: it is what reproduces legacy byte for byte.
+    """
+    decoupled, numLdsBlkA, numLdsBlkB = decouplePgrBlocks(kernel)
+    return decoupled and numLdsBlkA != numLdsBlkB
+
+
+  def _tdmDecoupledBlocks(self, kernel, tc):
+    """(number of LDS copies, stride) for one tensor under the decoupled layout."""
+    _, numLdsBlkA, numLdsBlkB = decouplePgrBlocks(kernel)
+    if self._tdmDecoupledGroup[tc] == "A":
+      return numLdsBlkA, kernel["LdsOffsetBlkA"]
+    return numLdsBlkB, kernel["LdsOffsetBlkB"]
+
+  def _decoupledSwapStride(self, kernel, tc):
+    """Byte distance between a tensor's two LDS copies, or 0 if it has only one.
+
+    Used by every addressing site that would otherwise reach for the single
+    whole-block LdsOffsetA_Blk, which cannot describe two groups at once.
+    """
+    numBlk, stride = self._tdmDecoupledBlocks(kernel, tc)
+    return stride if numBlk >= 2 else 0
+
+  def _tdmDecoupledSwapArm(self, kernel, tc, ldsAddrSgprName, tmpSgprIdx) -> Module:
+    """Toggle one tensor's descriptor between its two LDS copies.
+
+    The comparison is against the tensor's own second-copy base, not against the
+    delta. A descriptor holds LdsOffset<tc> + waveOffset, so comparing against
+    the delta only happens to work while the tensor's base is below it, which
+    stops being true once each group carries its own stride.
+    """
+    numBlk, stride = self._tdmDecoupledBlocks(kernel, tc)
+    module = Module(f"TDM LDS swap {tc}")
+    if numBlk < 2:
+      module.addComment0(f"TDM decoupled swap {tc}: single-buffered, no swap")
+      return module
+    secondCopyBase = kernel[f"LdsOffset{tc}"] + stride
+    module.addComment0(f"TDM decoupled swap {tc}: stride={stride} secondCopyBase={secondCopyBase}")
+    module.add(SCmpLtU32(sgpr(ldsAddrSgprName), secondCopyBase,
+                         f"{tc}: below 2nd-copy base {secondCopyBase}?"))
+    module.add(SMovB32(sgpr(tmpSgprIdx), -stride, "Init as -blk"))
+    module.add(SCSelectB32(sgpr(tmpSgprIdx), stride, sgpr(tmpSgprIdx), "<: +blk, >=: -blk"))
+    module.add(SAddI32(sgpr(ldsAddrSgprName), sgpr(ldsAddrSgprName), sgpr(tmpSgprIdx), "Do swap"))
+    return module
+
+  def _tdmSwapLdsOffsetDecoupled(self, kernel, tP, ldsAddrSgprName) -> Module:
+    """TDM LDS swap when PrefetchGlobalReadA/B give the tensors separate layouts.
+
+    Wave-parity aware rather than un-aliased: the shared descriptor already holds
+    A's address on even waves and B's on odd waves, and the kernel already
+    branches on that same parity to program it, so each parity can simply apply
+    its own tensor's rule. Un-aliasing would instead cost 12 SGPRs for B plus 12
+    for MXSB and require re-plumbing every tensor_load_to_lds and the parity-
+    separated descriptor init, with no addressing benefit.
+    """
+    tc: str = tP["tensorChar"]
+    aliased = kernel["NumWaves"] > 1 and not kernel.get("UseSubtileImpl")
+    partner = self._tdmDecoupledAliasPartner.get(tc) if (aliased and kernel["enableTDMB"]) else None
+
+    if partner is None:
+      # Separate descriptors: this call owns exactly one tensor.
+      module = Module(f"TDM LDS swap {tc} (decoupled)")
+      if self._tdmDecoupledBlocks(kernel, tc)[0] < 2:
+        module.addComment0(f"TDM decoupled swap {tc}: single-buffered, no swap")
+        return module
+      with self.allocTmpSgpr(1, tag="tdmSwapLdsOffset_tmpSgprRes") as tmpSgprRes:
+        module.add(self._tdmDecoupledSwapArm(kernel, tc, ldsAddrSgprName, tmpSgprRes.idx))
+      return module
+
+    numBlkEven = self._tdmDecoupledBlocks(kernel, tc)[0]
+    numBlkOdd = self._tdmDecoupledBlocks(kernel, partner)[0]
+    module = Module(f"TDM LDS swap {tc}/{partner} (decoupled, wave-parity)")
+    if numBlkEven < 2 and numBlkOdd < 2:
+      module.addComment0(f"TDM decoupled swap {tc}/{partner}: both single-buffered, no swap")
+      return module
+
+    with self.allocTmpSgpr(1, tag="tdmSwapLdsOffset_tmpSgprRes") as tmpSgprRes:
+      tmpSgprIdx = tmpSgprRes.idx
+      lblEnd = Label(self.labels.getNameInc(f"TDMSwap{tc}{partner}End"), "")
+      module.addComment0(f"TDM decoupled swap: even waves={tc}({numBlkEven} blk), odd waves={partner}({numBlkOdd} blk)")
+      module.add(SBitcmp1B32(sgpr("WaveIdx"), 0, "Check parity of wId"))
+      if numBlkEven < 2:
+        module.add(SCBranchSCC0(lblEnd.getLabelName(), f"even waves hold {tc}, single-buffered: skip"))
+        module.add(self._tdmDecoupledSwapArm(kernel, partner, ldsAddrSgprName, tmpSgprIdx))
+      elif numBlkOdd < 2:
+        module.add(SCBranchSCC1(lblEnd.getLabelName(), f"odd waves hold {partner}, single-buffered: skip"))
+        module.add(self._tdmDecoupledSwapArm(kernel, tc, ldsAddrSgprName, tmpSgprIdx))
+      else:
+        lblOdd = Label(self.labels.getNameInc(f"TDMSwap{partner}"), "")
+        module.add(SCBranchSCC1(lblOdd.getLabelName(), f"Jump to {partner} if wId is odd"))
+        module.add(self._tdmDecoupledSwapArm(kernel, tc, ldsAddrSgprName, tmpSgprIdx))
+        module.add(SBranch(lblEnd.getLabelName()))
+        module.add(lblOdd)
+        module.add(self._tdmDecoupledSwapArm(kernel, partner, ldsAddrSgprName, tmpSgprIdx))
+      module.add(lblEnd)
+    return module
+
   def tdmSwapLdsOffset(self, kernel, tP) -> Module:
     tc: str = tP["tensorChar"]
     strippedTc: str = tc[-1]
@@ -11866,11 +11993,15 @@ class KernelWriterAssembly(KernelWriter):
     if not needSwap:
       return Module("TDM LDS swap (Empty)")
 
+    comp: TensorDataMoverLoad = TensorDataMoverLoad.find(self)
+    ldsAddrSgprName: str = comp.getLdsAddrSgprName(f"tdm{tc}Group0")
+
+    if self._dcpDivergent(kernel):
+      return self._tdmSwapLdsOffsetDecoupled(kernel, tP, ldsAddrSgprName)
+
     module: Module = Module("TDM LDS swap")
     storeSwapAddr = kernel["StoreSwapAddr"]
     module.addComment(f"TDM LDS swap(aligned pow2: {not storeSwapAddr})")
-    comp: TensorDataMoverLoad = TensorDataMoverLoad.find(self)
-    ldsAddrSgprName: str = comp.getLdsAddrSgprName(f"tdm{tc}Group0")
 
     if not kernel["StoreSwapAddr"]:
       swapMask: int = kernel[f"LdsOffsetA_Blk"]
@@ -13043,7 +13174,9 @@ class KernelWriterAssembly(KernelWriter):
         comment="LocalReadAddr = Inc + Orig"))
     elif internalPointerSwap or kernel["StoreSwapAddr"]:
       if not kernel["StoreSwapAddr"]:
-        tP["localReadSwapByteOffset"] = 0 if tP["localReadSwapByteOffset"] else kernel["LdsOffsetA_Blk"]
+        _lrBlk = self._decoupledSwapStride(kernel, tc) if self._dcpDivergent(kernel) \
+                 else kernel["LdsOffsetA_Blk"]
+        tP["localReadSwapByteOffset"] = 0 if tP["localReadSwapByteOffset"] else _lrBlk
         module.addComment1("local read swap internal offset -> %u" % tP["localReadSwapByteOffset"])
       else:
         module.add(VXorB32(
@@ -20146,15 +20279,20 @@ class KernelWriterAssembly(KernelWriter):
 
     return mod
 
-  def tdmSetupIncrementWaveSeparated(self, kernel, tpA, tpB) -> Module:
+  def tdmSetupIncrementWaveSeparated(self, kernel, tpA, tpB, zeroTc=None) -> Module:
     mod = Module()
     tcA: str = tpA["tensorChar"]
     tcB: str = tpB["tensorChar"]
     wavelen: int = kernel["WavefrontSize"]
     incSgprName = f"tdm{tcA}{tcB}Incs"
+    # zeroTc pins one tensor's pointer for a prefetch round that is not refilling
+    # it.  Zeroing one side of the select keeps the shared parity structure
+    # intact rather than adding a branch (cf. graIncrementMask).
+    srcOdd = 0 if zeroTc == tcB else sgpr(f"GlobalReadIncs{tcB}")
+    srcEven = 0 if zeroTc == tcA else sgpr(f"GlobalReadIncs{tcA}")
     mod.add(SBitcmp1B32(sgpr("WaveIdx"), 0, "Check parity of wId"))
     #TODO: should not directly use GRIA and GRIB
-    mod.add(SCSelectB32(sgpr(incSgprName), sgpr(f"GlobalReadIncs{tcB}"), sgpr(f"GlobalReadIncs{tcA}")))
+    mod.add(SCSelectB32(sgpr(incSgprName), srcOdd, srcEven))
     return mod
 
   def resetTDMDescriptorForTail(self, kernel: Mapping, tP: Mapping, tmpSgprWaveOffset = None) -> Module:

@@ -347,6 +347,19 @@ validParameters = { # we need to make sure this matches develop
     # Need to allocate PGR+1 or PGR LDS buffer
     # Allocating PGR+1 LDS buffer is better for instruction scheduling.
     "PrefetchGlobalRead": [0, 1, 2] + list(range(3,16 + 1)),
+    # Per-tensor prefetch depth, which is also the per-tensor LDS block count.
+    # 0 means "not active". As soon as either PrefetchGlobalReadA or
+    # PrefetchGlobalReadB is nonzero the solution enters decoupled mode: the
+    # scalar PrefetchGlobalRead above loses its LDS-block-count role and these
+    # take over completely (a warning is emitted saying so).
+    # A tensor always needs at least one LDS block and 0 doubles as the
+    # "not active" flag, so the block count is max(1, PrefetchGlobalRead<tc>):
+    # 0 and 1 both mean a single block.
+    # Replication is grouped by owner: A carries its MX scales (MXSA) and B
+    # carries its MX scales (MXSB), because double-buffering a tile without its
+    # scale factors would let tile N+1's scales overwrite tile N's.
+    "PrefetchGlobalReadA": [0, 1, 2] + list(range(3,16 + 1)),
+    "PrefetchGlobalReadB": [0, 1, 2] + list(range(3,16 + 1)),
     # number of iteration prefetch local reads from lds to VGPRs buffer = PLR
     "PrefetchLocalRead": list(range(128 + 1)),
     # Enable global memory to GL2 cache prefetch using global_prefetch_b8 instruction (gfx1250 only).

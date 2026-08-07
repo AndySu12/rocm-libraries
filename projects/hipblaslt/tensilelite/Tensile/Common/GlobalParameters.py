@@ -480,6 +480,8 @@ defaultBenchmarkCommonParameters = [
     {"WaveSeparateGlobalReadMetadata": [0]},
     {"UnrollLoopSwapGlobalReadOrder": [0]},
     {"PrefetchGlobalRead": [1]},
+    {"PrefetchGlobalReadA": [0]},
+    {"PrefetchGlobalReadB": [0]},
     {"PrefetchLocalRead": [1]},
     {"PrefetchGL2": [0]},
     {"ClusterLocalRead": [1]},

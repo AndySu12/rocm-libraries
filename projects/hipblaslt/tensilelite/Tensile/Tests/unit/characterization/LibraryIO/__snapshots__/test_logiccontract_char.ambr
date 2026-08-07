@@ -109,6 +109,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -357,6 +359,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -593,6 +597,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -844,6 +850,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -1112,6 +1120,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -1360,6 +1370,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -1622,6 +1634,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -1873,6 +1887,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -2124,6 +2140,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -2363,6 +2381,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -2614,6 +2634,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([
@@ -2864,6 +2886,8 @@
       'PrefetchAcrossPersistent': 0,
       'PrefetchGL2': 0,
       'PrefetchGlobalRead': 1,
+      'PrefetchGlobalReadA': 0,
+      'PrefetchGlobalReadB': 0,
       'PrefetchLocalRead': 1,
       'PreloadKernArgs': True,
       'SFCWGM': list([

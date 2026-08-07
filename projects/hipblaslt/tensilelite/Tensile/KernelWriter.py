@@ -50,7 +50,7 @@ from .Components.Signature import UserArgumentsInfo
 from .Components.CustomSchedule import customMainLoopSchedule
 from .Components.StreamK import streamKVariantClass
 from .Components.Subtile.Kernel import *
-from .SolutionStructs import Solution, isPackedIndex
+from .SolutionStructs import Solution, isPackedIndex, decoupledSingleBuffered, decouplePgrBlocks
 from .SolutionStructs.Utilities import getMiInputType
 from .AsmMemoryInstruction import MemoryInstruction
 from .Activation import ActivationModule
@@ -3160,7 +3160,38 @@ class KernelWriter(metaclass=abc.ABCMeta):
             tPA = None
           if kernel["DirectToVgprB"]:
             tPB = None
+        # Decouple PGR: a tensor whose LDS blocks are exhausted by this prefetch
+        # round is not being refilled by it, so its global-read pointer must not
+        # advance either, or the first loop iteration fetches past the block it
+        # still has to read.  Under wave-separated TDM both tensors share one
+        # increment register, so the per-tensor lever above (tP=None) is asserted
+        # out for NumWaves>1; hold the pointer by re-selecting that register with
+        # the exhausted side zeroed, then restore it before the main loop.
+        # Unreachable since divergent block counts became a reject: the
+        # condition below needs (pfi >= dcpBlkA) != (pfi >= dcpBlkB), which
+        # requires the counts to differ.  It did emit before the reject (removing
+        # it changed hero and mirror assembly), and it is kept for the same
+        # reason as the divergent layout: AIHPBLAS-4159 needs it.
+        dcpRound, dcpBlkA, dcpBlkB = decouplePgrBlocks(kernel)
+        dcpHoldTc = None
+        if dcpRound and tdmA and tdmB and kernel["NumWaves"] > 1 \
+           and (pfi >= dcpBlkA) != (pfi >= dcpBlkB):
+          dcpHoldTc = tensorParametersA["tensorChar"] if pfi >= dcpBlkA \
+                      else tensorParametersB["tensorChar"]
+          dcpHoldMX = ("MX" in tensorParametersA) and ("MX" in tensorParametersB)
+          module.add(self.tdmSetupIncrementWaveSeparated(
+              kernel, tensorParametersA, tensorParametersB, zeroTc=dcpHoldTc))
+          if dcpHoldMX:
+            module.add(self.tdmSetupIncrementWaveSeparated(
+                kernel, tensorParametersA["MX"], tensorParametersB["MX"],
+                zeroTc="MXS%s" % dcpHoldTc))
         module.add(self.globalReadIncrementAB(kernel, tPA, tPB, self.states.unrollIdx, pfi))
+        if dcpHoldTc is not None:
+          module.add(self.tdmSetupIncrementWaveSeparated(
+              kernel, tensorParametersA, tensorParametersB))
+          if dcpHoldMX:
+            module.add(self.tdmSetupIncrementWaveSeparated(
+                kernel, tensorParametersA["MX"], tensorParametersB["MX"]))
         # swap Tensor memToken
         self.states.ldsTensorTokenIdx = \
             self.states.memTokenLdsBuffer1 if self.states.ldsTensorTokenIdx == self.states.memTokenLdsBuffer0 else self.states.memTokenLdsBuffer0
@@ -5819,8 +5850,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     def _kernelBody(pack, packPre, nta, ntb):
       # open unrolled summation loop
       module.addComment2("Unrolled Loop(s) - Begin")
-      if kernel["enableTDMA"] and kernel["enableTDMB"] and not kernel["PrefetchGlobalRead"]:
-        module.add(SBarrier(comment="TDM PGR=0: prime barrier before loop"))
+      if kernel["enableTDMA"] and kernel["enableTDMB"] and \
+         (not kernel["PrefetchGlobalRead"] or decoupledSingleBuffered(kernel)):
+        primeWhy = "PGR=0" if not kernel["PrefetchGlobalRead"] else "single LDS blk"
+        module.add(SBarrier(comment=f"TDM {primeWhy}: prime barrier before loop"))
       module.add(self.openLoop(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx, beginLabelOnly=False, nta=nta, ntb=ntb))
 
       loop = Module("loopBody")
@@ -7343,7 +7376,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.useCommonSgprSwap = True
     # set memory token by LDS buffer setting
     self.states.memTokenLdsBufferMeta = 4
-    if kernel["1LDSBuffer"]:
+    # A single-buffered tensor reads and refills the same bytes, so the two
+    # buffer tokens must collapse to one or the dependency tracker sees the
+    # refill land on a buffer nothing read and postMainLoopBarrierCheckAndReset
+    # emits no barrier for a real write-after-read. This is the same collapse
+    # 1LDSBuffer already relies on -- the difference is that under decoupled
+    # PGR only one of the two tensors may be single-buffered, and the wave-
+    # separated tensor_load_to_lds is shared between them, so one token has to
+    # cover both. Collapsing is the conservative direction: it can only add
+    # barriers, never remove one that was required.
+    if kernel["1LDSBuffer"] or decoupledSingleBuffered(kernel):
       self.states.memTokenLdsBuffer0 = 0
       self.states.memTokenLdsBuffer1 = 0
       self.states.memTokenLdsSplit = [[1, 2], [1, 2]]
@@ -11277,7 +11319,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
   def tdmIncrementABWaveSperated(self, kernel, tPA, tPB, loopIdx=None, prefetchIndex=0) -> Module:
     assert False, "Should be overrided"
 
-  def tdmSetupIncrementWaveSeparated(self, kernel, tPA, tPB) -> Module:
+  def tdmSetupIncrementWaveSeparated(self, kernel, tPA, tPB, zeroTc=None) -> Module:
     assert False, "Should be overrided"
   
   @abc.abstractmethod
