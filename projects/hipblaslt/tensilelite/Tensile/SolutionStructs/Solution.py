@@ -527,18 +527,24 @@ def pgrLevelsForTensors(ks):
 
 
 def ldsBlocksForPgrLevel(pgr):
-  """LDS block count the scalar derivation allocates for PrefetchGlobalRead == pgr.
+  """LDS blocks a per-tensor PrefetchGlobalRead level allocates.
 
-  Mirrors assignDerivedParameters below for the shapes decoupled PGR can reach
-  (1LDSBuffer != 1, and DtlPlusLdsBuf which needs DirectToLds and so is always
-  0 here): one block with no prefetch, two blocks at levels 1 and 2 alike, and
-  the literal level from 3 up. Routing the per-tensor count through the same map
-  is what makes (N,N) identical to legacy PrefetchGlobalRead=N rather than
-  merely similar to it.
+  The per-tensor value is read as a *block count*, which is how the requesting
+  side computes per-tensor LDS:
+
+    0  no prefetch, one block
+    1  prefetch,    one block   (the shape 1LDSBuffer=1 implements)
+    2  prefetch,    two blocks  (conventional ping-pong)
+    k  k blocks, as the scalar derivation does from level 3 up
+
+  Level 1 is the rung that moved: the scalar derivation allocates two blocks for
+  PrefetchGlobalRead=1, so (1,1) is legacy PrefetchGlobalRead=1 *combined with*
+  1LDSBuffer=1 rather than plain PrefetchGlobalRead=1. (0,0) and (2,2) still
+  reproduce legacy levels 0 and 2 directly.
   """
-  if pgr <= 0:
+  if pgr <= 1:
     return 1
-  return 2 if pgr <= 2 else pgr
+  return 2 if pgr == 2 else pgr
 
 
 def decouplePgrBlocks(ks):
@@ -553,16 +559,19 @@ def decouplePgrBlocks(ks):
 
 
 def decoupledSingleBuffered(ks):
-  """True when decoupled PGR leaves one tensor unprefetched inside a prefetching loop.
+  """True when decoupled PGR leaves one tensor on a single LDS block inside a
+  prefetching loop.
 
-  A tensor at level 0 gets a single LDS block, so its next tile lands on top of
-  the copy the current iteration is still reading and the write-after-read
-  barriers have to fire even though the scalar PrefetchGlobalRead is nonzero.
-  Legacy already emits those barriers when the whole kernel is at level 0, so
-  only the mixed case needs this: one tensor at 0 with a deeper loop envelope.
+  A one-block tensor has nowhere to put its next tile except on top of the copy
+  the current iteration is still reading, so the write-after-read barriers have
+  to fire even though the scalar PrefetchGlobalRead is nonzero. Keyed on the
+  resolved *block counts*, not on the levels: under the block-count reading both
+  level 0 and level 1 give one block, and the hazard follows the block count.
+  The both-single-block case is excluded because it pins 1LDSBuffer, whose own
+  read-sync-write barrier already covers it; only the mixed case needs this.
   """
-  decoupled, pgrA, pgrB = pgrLevelsForTensors(ks)
-  return decoupled and min(pgrA, pgrB) <= 0 and max(pgrA, pgrB) > 0
+  decoupled, numLdsBlkA, numLdsBlkB = decouplePgrBlocks(ks)
+  return decoupled and min(numLdsBlkA, numLdsBlkB) == 1 and max(numLdsBlkA, numLdsBlkB) > 1
 
 
 # kds is class Solution or class Kernel
@@ -4988,18 +4997,22 @@ class Solution(collections.abc.Mapping):
     state["LdsNumElementsAlignedMetadata"] = int(ldsNumBytesAlignedMetadata)
 
     # Per-tensor PrefetchGlobalRead ("Decouple PGR").
-    # PrefetchGlobalReadA/B are per-tensor PrefetchGlobalRead levels: level N on
-    # a tensor means that tensor behaves as if PrefetchGlobalRead were N. The
-    # block count each level implies comes from ldsBlocksForPgrLevel, the same
-    # map the scalar derivation below uses, so (N,N) reproduces legacy
-    # PrefetchGlobalRead=N exactly. An absent key means "not specified" and
-    # falls back to the scalar; 0 is a real level.
+    # PrefetchGlobalReadA/B are per-tensor LDS *block counts* dressed as
+    # PrefetchGlobalRead levels: 0 = no prefetch/one block, 1 = prefetch/one
+    # block, 2 = prefetch/two blocks, k>=3 = k blocks. ldsBlocksForPgrLevel is
+    # the single source of that map and both Solution and KernelWriterAssembly
+    # read it. An absent key means "not specified" and falls back to the scalar;
+    # 0 is a real level. (0,0) is legacy PrefetchGlobalRead=0 and (2,2) is
+    # legacy PrefetchGlobalRead=2; (1,1) is legacy PrefetchGlobalRead=1 with
+    # 1LDSBuffer=1, which is pinned below.
     decouplePGR, pgrA, pgrB = pgrLevelsForTensors(state)
     numLdsBlkA = ldsBlocksForPgrLevel(pgrA)
     numLdsBlkB = ldsBlocksForPgrLevel(pgrB)
     # Only divergent block counts need the owner-grouped LDS layout. Equal counts
-    # are left entirely to the legacy layout below, which is what makes them
-    # byte-identical to the scalar level rather than merely equivalent to it.
+    # are left entirely to the legacy layout below (with 1LDSBuffer pinned when
+    # that layout is the single-block one), which is what makes them
+    # byte-identical to an existing legacy configuration rather than merely
+    # equivalent to it.
     dcpDivergent = decouplePGR and numLdsBlkA != numLdsBlkB
     if decouplePGR:
       # Store the resolved levels so a decoupled solution round-trips through
@@ -5023,9 +5036,11 @@ class Solution(collections.abc.Mapping):
                % (state["PrefetchGlobalRead"], pgrA, pgrB, max(pgrA, pgrB)))
         return
       if pgrA != pgrB and numLdsBlkA == numLdsBlkB:
-        # Levels 1 and 2 both allocate two LDS blocks and the loop depth is a
-        # single scalar, so at these levels the two requests differ in nothing
-        # this increment implements. Say so instead of pretending otherwise.
+        # Different levels that land on the same block count (0 and 1) differ in
+        # nothing this increment implements: the loop depth is a single scalar
+        # and, under wave-separated TDM, both tensors are loaded by one shared
+        # instruction, so there is no per-tensor cadence lever. Say so instead
+        # of pretending otherwise.
         printWarning(
           "PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u both resolve to %u LDS block(s) "
           "and share one loop envelope, so this solution is identical to "
@@ -5076,6 +5091,24 @@ class Solution(collections.abc.Mapping):
       if state["DtlPlusLdsBuf"]:
         # force 1LDSBuffer = 0
         state["1LDSBuffer"] = 0
+
+    # Decoupled PGR, block-count reading: level 1 means "prefetch into a single
+    # LDS block". When BOTH tensors land on one block and the loop still
+    # prefetches, the shape asked for is exactly what 1LDSBuffer=1 already
+    # implements -- one shared block, the read-sync-write barrier at
+    # sync1LdsMfmaIndex, no buffer swap -- so pin it and reuse that mechanism
+    # rather than growing a second single-block path. This is what makes (1,1)
+    # byte-identical to legacy PrefetchGlobalRead=1 + 1LDSBuffer=1: it runs the
+    # identical code, it is not made equal to it.
+    if decouplePGR and not dcpDivergent and numLdsBlkA == 1 and state["PrefetchGlobalRead"]:
+      if state["1LDSBuffer"] == 0:
+        printWarning(
+          "PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u each request a single LDS block, "
+          "which is the shape 1LDSBuffer=1 implements, but 1LDSBuffer=0 was requested "
+          "explicitly. Honouring the per-tensor request and setting 1LDSBuffer=1; use "
+          "PrefetchGlobalReadA/B=2 if double buffering was intended. (AIHPBLAS-4159)"
+          % (pgrA, pgrB))
+      state["1LDSBuffer"] = 1
 
     # Here, 1LDSBuffer == -1 is not resolved yet.
     # (cannot move 1LDSBuffer==-1 resolution code above because of referring ldsNumBytesAB)

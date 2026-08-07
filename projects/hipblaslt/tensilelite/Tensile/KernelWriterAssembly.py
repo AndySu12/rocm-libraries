@@ -11881,8 +11881,8 @@ class KernelWriterAssembly(KernelWriter):
   def _dcpDivergent(self, kernel):
     """True only when A and B carry different LDS block counts.
 
-    True when exactly one tensor is at PrefetchGlobalRead level 0, since levels 1
-    and 2 both allocate two blocks. The paths guarded by this predicate -- the
+    True when exactly one tensor is at level 0 or 1 (one block) and the other at
+    2 or above. The paths guarded by this predicate -- the
     decoupled TDM swap and the per-tensor swap strides at the four addressing
     sites -- are the unfinished part of AIHPBLAS-4159; they emit, but per-tensor
     runtime addressing is not complete, so a divergent kernel can compute wrong
