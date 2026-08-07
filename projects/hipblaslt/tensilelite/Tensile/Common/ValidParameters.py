@@ -359,7 +359,10 @@ validParameters = { # we need to make sure this matches develop
     # TWO blocks for PrefetchGlobalRead=1. So the pairs that reduce to a legacy
     # configuration are
     #   (0,0)  ==  PrefetchGlobalRead=0
-    #   (1,1)  ==  PrefetchGlobalRead=1 *with* 1LDSBuffer=1, not plain level 1
+    #   (1,1)  ==  one LDS block per tensor, allocated directly. Emits the same
+    #              instructions as PrefetchGlobalRead=1 + 1LDSBuffer=1 at SIA 2
+    #              or 3, but does not set that parameter and is not restricted
+    #              to those ScheduleIterAlgs.
     #   (2,2)  ==  PrefetchGlobalRead=2
     # each byte-identical to its legacy counterpart in both the instruction
     # stream and the LDS total; _pgr/impl_v2/pgr_regress.sh asserts those three.
