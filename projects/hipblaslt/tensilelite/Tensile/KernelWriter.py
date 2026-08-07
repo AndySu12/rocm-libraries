@@ -50,7 +50,7 @@ from .Components.Signature import UserArgumentsInfo
 from .Components.CustomSchedule import customMainLoopSchedule
 from .Components.StreamK import streamKVariantClass
 from .Components.Subtile.Kernel import *
-from .SolutionStructs import Solution, isPackedIndex, decoupledSingleBuffered, decouplePgrBlocks
+from .SolutionStructs import Solution, isPackedIndex, decoupledSingleBuffered, decouplePgrBlocks, decoupledOneBlockBoth
 from .SolutionStructs.Utilities import getMiInputType
 from .AsmMemoryInstruction import MemoryInstruction
 from .Activation import ActivationModule
@@ -1110,7 +1110,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       for item in readItems:
         iterCode.add(item)
 
-      if kernel["1LDSBuffer"]:
+      if kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel):
         if localWriteCode.itemsSize() > 0:
           barrier = Module()
           barrier.addComment0("1 LDS buffer: read-sync-write")
@@ -1247,7 +1247,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         iterCode.add(macIterItems.pop(0))
 
       iterCode.add(SSetPrior(prior=1, comment="Raise priority while processing macs"))
-      if kernel["1LDSBuffer"]:
+      if kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel):
         barrier = Module()
         barrier.addComment0("1 LDS buffer: read-sync-write")
         barrier.add(SWaitCnt(dscnt=0, comment=""))
@@ -1902,7 +1902,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         ####
         # scheduled local write
         ####
-        if kernel["1LDSBuffer"] and mfmaIndex == self.states.sync1LdsMfmaIndex:
+        if (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel)) and mfmaIndex == self.states.sync1LdsMfmaIndex:
           barrier = Module()
           barrier.addComment0("1 LDS buffer: read-sync-write")
           barrier.add(SWaitCnt(dscnt=0, comment=""))
@@ -6321,7 +6321,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
         elif tc2 == 'B':
           globalReadMode2nd = 2
 
-      if (kernel["enableTDMA"] or kernel["enableTDMB"]) and not kernel["1LDSBuffer"]:
+      if (kernel["enableTDMA"] or kernel["enableTDMB"]) and \
+         not (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel)):
         module.add(self._syncThreads(kernel, "Barrier before tail TDM loads (WAR hazard with NLL LDS reads)"))
 
       if kernel["enableTDMA"] and kernel["enableTDMB"]:
@@ -6477,7 +6478,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
                            self.states.numReadsIterCoalescedB > 1)
       # TDM tail may keep using whichever LDS buffer the swap parity left it in
       # (no forced buffer 0), unless wider local read needs the offset recomputed.
-      needResetLROffsets = not kernel["1LDSBuffer"] and (not tdm or tdmTailWasWiderLR)
+      needResetLROffsets = not (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel)) \
+                           and (not tdm or tdmTailWasWiderLR)
       # change local read policy from wider local read to one unit of K at a time
       # DirectToVgpr case, use original wider local read instead of recalculating local read address
       if not (kernel["DirectToVgprA"] or kernel["DirectToVgprB"]):
@@ -7427,7 +7429,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # use inc to switch Lds Buffers (instead of using xor)
     self.states.IncLdsBufSwitch = kernel["NumLdsBlk"] >= 3
     # oneBufferScheduling
+    # DirectToLds already earns one-buffer scheduling by holding exactly as many
+    # LDS blocks as the prefetch depth -- no VGPR staging buffer, so the counts
+    # line up. Decoupled PGR reaches the same shape under TDM, which that
+    # condition never covered.
     self.states.oneBufferScheduling = (kernel["1LDSBuffer"]) or \
+                                      decoupledOneBlockBoth(kernel) or \
                                       ((kernel["DirectToLdsA"] or kernel["DirectToLdsB"]) and \
                                        self.states.numLDSBlk == kernel["PrefetchGlobalRead"])
     # common sgprSwap
@@ -7450,7 +7457,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # separated tensor_load_to_lds is shared between them, so one token has to
     # cover both. Collapsing is the conservative direction: it can only add
     # barriers, never remove one that was required.
-    if kernel["1LDSBuffer"] or decoupledSingleBuffered(kernel):
+    if kernel["1LDSBuffer"] or decoupledSingleBuffered(kernel) or decoupledOneBlockBoth(kernel):
       self.states.memTokenLdsBuffer0 = 0
       self.states.memTokenLdsBuffer1 = 0
       self.states.memTokenLdsSplit = [[1, 2], [1, 2]]
