@@ -5231,11 +5231,26 @@ class Solution(collections.abc.Mapping):
       state["LdsOffsetB"] = baseB + offBinB
       state["LdsOffsetBlkA"] = blkA
       state["LdsOffsetBlkB"] = blkB
-      # Absolute bases of the second copy of each segment.
-      state["LdsOffsetMXSA_Blk"] = state["LdsOffsetMXSA"] + blkA
-      state["LdsOffsetMXSB_Blk"] = state["LdsOffsetMXSB"] + blkB
-      state["LdsOffsetMetadata_Blk"] = state["LdsOffsetMetadata"] + blkB
-      state["LdsOffsetB_Blk"] = state["LdsOffsetB"] + blkB
+      # Absolute bases of the second copy of each segment -- only for a group
+      # that has a second copy. A one-copy group has no such address, and naming
+      # one anyway does not produce a harmless number: on the hero, group A holds
+      # one copy and LdsOffsetMXSA + blkA lands at 67584, which is 33280 bytes
+      # inside group B's first copy; with B single-buffered, LdsOffsetB + blkB
+      # lands past the end of the allocation entirely. The same 67584 is a
+      # correct second-copy base in the mirror, where group A does double-buffer,
+      # so whether the value means anything depends on the configuration and
+      # nothing in the key or its computation records which. Leave the key out
+      # instead, so a consumer that reaches for it fails at build time rather
+      # than emitting an address into someone else's tile.
+      for _key, _base, _stride, _copies in (
+          ("LdsOffsetMXSA_Blk",     state["LdsOffsetMXSA"],     blkA, nBlkA),
+          ("LdsOffsetMXSB_Blk",     state["LdsOffsetMXSB"],     blkB, nBlkB),
+          ("LdsOffsetMetadata_Blk", state["LdsOffsetMetadata"], blkB, nBlkB),
+          ("LdsOffsetB_Blk",        state["LdsOffsetB"],        blkB, nBlkB)):
+        if _copies >= 2:
+          state[_key] = _base + _stride
+        else:
+          state.pop(_key, None)
       # LdsOffsetA_Blk is misnamed: every consumer reads it as *the* whole-block
       # swap stride (LdsOneBlockSize, xor/AND swap masks), not as A's offset.
       # One scalar cannot describe two different strides, so report the stride of

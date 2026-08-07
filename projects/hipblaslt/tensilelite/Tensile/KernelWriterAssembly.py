@@ -11926,6 +11926,15 @@ class KernelWriterAssembly(KernelWriter):
       module.addComment0(f"TDM decoupled swap {tc}: single-buffered, no swap")
       return module
     secondCopyBase = kernel[f"LdsOffset{tc}"] + stride
+    # Cross-check the recorded key against the address actually emitted, so the
+    # two cannot drift. setLdsOffsetsDecoupled only records LdsOffset<tc>_Blk for
+    # a group that has a second copy, and numBlk >= 2 here means this one does,
+    # so the key must be present and must agree. A is exempt: LdsOffsetA_Blk is
+    # the overloaded whole-block swap stride, not A's second-copy base.
+    if tc != "A":
+      assert kernel[f"LdsOffset{tc}_Blk"] == secondCopyBase, \
+        f"LdsOffset{tc}_Blk={kernel[f'LdsOffset{tc}_Blk']} disagrees with the " \
+        f"second-copy base {secondCopyBase} this swap emits"
     module.addComment0(f"TDM decoupled swap {tc}: stride={stride} secondCopyBase={secondCopyBase}")
     module.add(SCmpLtU32(sgpr(ldsAddrSgprName), secondCopyBase,
                          f"{tc}: below 2nd-copy base {secondCopyBase}?"))
