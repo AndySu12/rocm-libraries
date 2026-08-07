@@ -50,7 +50,7 @@ from .Components.Signature import UserArgumentsInfo
 from .Components.CustomSchedule import customMainLoopSchedule
 from .Components.StreamK import streamKVariantClass
 from .Components.Subtile.Kernel import *
-from .SolutionStructs import Solution, isPackedIndex
+from .SolutionStructs import Solution, isPackedIndex, decoupledSingleBuffered, decouplePgrBlocks, decoupledOneBlockBoth
 from .SolutionStructs.Utilities import getMiInputType
 from .AsmMemoryInstruction import MemoryInstruction
 from .Activation import ActivationModule
@@ -701,6 +701,94 @@ class KernelWriter(metaclass=abc.ABCMeta):
         localWriteEndIter, firstIter, lastLoop, lastLc, globalReadIncACode, \
         globalReadIncBCode, isNGLL)
 
+    self._dcpScheduleSingleBufferedFillLate(kernel)
+
+  ##############################################################################
+  # Decouple PGR: re-slot a single-buffered tensor's fill inside the loop body.
+  #
+  # At loop envelope 1 the body issues its fill at the top of the iteration for
+  # the tile the *next* iteration consumes, and the tile this iteration consumes
+  # sits in the other LDS block. A tensor with one block has no other block, so
+  # that fill lands on the bytes this iteration is still reading. The window a
+  # single block does have is between the iteration's last local read of the
+  # block and the prefetched read that opens the next iteration, which is the
+  # sub-iteration carrying the pre-read sync (LoopIters - numItersPLR). Moving
+  # the fill there is what makes one block legal without changing the pipeline
+  # for the other tensor.
+  #
+  # The load and its increment are already wave-parity separated: one shared
+  # tensor_load_to_lds whose descriptor resolves to A on even waves and B on
+  # odd. So both slots emit the same module under complementary parity guards
+  # and every wave still issues exactly one fill and one advance per iteration.
+  # Round counts, the post-loop pointer, the NoLoadLoop and the tail are
+  # therefore all unchanged; only where one tensor's fill sits inside the
+  # iteration moves. That is also why no round has to be added to the peel or
+  # the NoLoadLoop: the last body iteration's late fill already delivers the
+  # tile the NoLoadLoop reads.
+  ##############################################################################
+  def _dcpScheduleSingleBufferedFillLate(self, kernel):
+    if not self._dcpDivergent(kernel):
+      return
+    # At SIA0 with PrefetchGlobalRead=1 the body's fill is not distributed over
+    # sub-iterations; noSchedGlobalRead parks the whole group in the unrolled
+    # loop header, which _loopBody emits at the top of the body. That group is
+    # what has to be duplicated. A copy of the loop body that carries no fill
+    # (NoLoadLoop, NGLL) has nothing to move.
+    src = self.codes.unrollLoopHeader
+    if src is None or not src.itemsSize():
+      return
+    if self.codes.globalReadA is None or not self.codes.globalReadA.middle.itemsSize():
+      return
+
+    # Preconditions are pinned by the reject in Solution.py, so a violation here
+    # is an emitter bug rather than an unsupported solution.
+    assert self.isTdmWaveSeparated(kernel), \
+      "decoupled PGR with divergent block counts needs the wave-separated TDM descriptor"
+    lateIter = kernel["LoopIters"] - self.states.numItersPLR
+    assert 0 < lateIter < kernel["LoopIters"], \
+      "decoupled PGR: no sub-iteration between the last local read and the pre-read sync"
+
+    _, numLdsBlkA, numLdsBlkB = decouplePgrBlocks(kernel)
+    singleIsA = numLdsBlkA < numLdsBlkB
+    singleTc  = "A" if singleIsA else "B"
+    doubleTc  = "B" if singleIsA else "A"
+    # The parity check leaves SCC set on odd waves, and odd waves carry B.
+    skipEarly = SCBranchSCC0 if singleIsA else SCBranchSCC1
+    skipLate  = SCBranchSCC1 if singleIsA else SCBranchSCC0
+
+    def parityCheck(mod):
+      if self.isTdmWaveIdxLive(kernel):
+        self._emitTdmWaveParitySCC(mod, kernel, comment="check wave parity")
+      else:
+        with self.allocTmpSgpr(1, tag="dcpLateFill_waveIdx") as tmp:
+          self._emitTdmWaveParitySCC(mod, kernel, tmp.idx, "check wave parity")
+
+    late = Module("TDM decoupled late fill %s" % singleTc)
+    # Every wave reads the single-buffered block during this iteration, so the
+    # refill is a write-after-read against the whole workgroup and not just this
+    # wave. Close it here; the sync already sitting at the head of this
+    # sub-iteration is what closes the read-after-write against the next
+    # iteration's prefetched read.
+    late.add(SWaitCnt(dscnt=0, comment="TDM decoupled: all ds_reads done before %s refill" % singleTc))
+    late.add(SBarrier(comment="TDM decoupled: signal+wait done reading %s block" % singleTc))
+    lblLate = Label(self.labels.getNameInc("DcpLateFill%sEnd" % singleTc), "")
+    parityCheck(late)
+    late.add(skipLate(labelName=lblLate.getLabelName(),
+                      comment="%s is double-buffered, its fill stays at the top" % doubleTc))
+    late.add(deepcopy(src))
+    late.add(lblLate)
+
+    early = Module("TDM decoupled early fill %s" % doubleTc)
+    lblEarly = Label(self.labels.getNameInc("DcpEarlyFill%sEnd" % doubleTc), "")
+    parityCheck(early)
+    early.add(skipEarly(labelName=lblEarly.getLabelName(),
+                        comment="%s is single-buffered, its fill moves late" % singleTc))
+    early.add(src)
+    early.add(lblEarly)
+    self.codes.unrollLoopHeader = early
+
+    self.codes.perIterGlobalRead[lateIter].add(late)
+
   ##############################################################################
   # packItemsConditional: pack src items into dst items until numPack or searchString is found
   # returns number of items packed
@@ -1022,7 +1110,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       for item in readItems:
         iterCode.add(item)
 
-      if kernel["1LDSBuffer"]:
+      if kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel):
         if localWriteCode.itemsSize() > 0:
           barrier = Module()
           barrier.addComment0("1 LDS buffer: read-sync-write")
@@ -1159,7 +1247,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         iterCode.add(macIterItems.pop(0))
 
       iterCode.add(SSetPrior(prior=1, comment="Raise priority while processing macs"))
-      if kernel["1LDSBuffer"]:
+      if kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel):
         barrier = Module()
         barrier.addComment0("1 LDS buffer: read-sync-write")
         barrier.add(SWaitCnt(dscnt=0, comment=""))
@@ -1814,7 +1902,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         ####
         # scheduled local write
         ####
-        if kernel["1LDSBuffer"] and mfmaIndex == self.states.sync1LdsMfmaIndex:
+        if (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel)) and mfmaIndex == self.states.sync1LdsMfmaIndex:
           barrier = Module()
           barrier.addComment0("1 LDS buffer: read-sync-write")
           barrier.add(SWaitCnt(dscnt=0, comment=""))
@@ -3160,6 +3248,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
             tPA = None
           if kernel["DirectToVgprB"]:
             tPB = None
+        # Decouple PGR keeps the legacy prologue here on purpose: both tensors
+        # take this round and both advance. A single-buffered tensor is made
+        # legal by where its fill sits inside the loop body
+        # (_dcpScheduleSingleBufferedFillLate), not by lagging its pointer, so
+        # round counts and the post-loop pointer stay exactly legacy's and the
+        # tail needs no compensation. An earlier attempt held the exhausted
+        # side's increment here; that leaves the tensor one tile behind from the
+        # second unrolled iteration onwards and is why it is gone.
         module.add(self.globalReadIncrementAB(kernel, tPA, tPB, self.states.unrollIdx, pfi))
         # swap Tensor memToken
         self.states.ldsTensorTokenIdx = \
@@ -5819,8 +5915,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     def _kernelBody(pack, packPre, nta, ntb):
       # open unrolled summation loop
       module.addComment2("Unrolled Loop(s) - Begin")
-      if kernel["enableTDMA"] and kernel["enableTDMB"] and not kernel["PrefetchGlobalRead"]:
-        module.add(SBarrier(comment="TDM PGR=0: prime barrier before loop"))
+      if kernel["enableTDMA"] and kernel["enableTDMB"] and \
+         (not kernel["PrefetchGlobalRead"] or decoupledSingleBuffered(kernel)):
+        primeWhy = "PGR=0" if not kernel["PrefetchGlobalRead"] else "single LDS blk"
+        module.add(SBarrier(comment=f"TDM {primeWhy}: prime barrier before loop"))
       module.add(self.openLoop(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx, beginLabelOnly=False, nta=nta, ntb=ntb))
 
       loop = Module("loopBody")
@@ -6223,7 +6321,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
         elif tc2 == 'B':
           globalReadMode2nd = 2
 
-      if (kernel["enableTDMA"] or kernel["enableTDMB"]) and not kernel["1LDSBuffer"]:
+      if (kernel["enableTDMA"] or kernel["enableTDMB"]) and \
+         not (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel)):
         module.add(self._syncThreads(kernel, "Barrier before tail TDM loads (WAR hazard with NLL LDS reads)"))
 
       if kernel["enableTDMA"] and kernel["enableTDMB"]:
@@ -6379,7 +6478,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
                            self.states.numReadsIterCoalescedB > 1)
       # TDM tail may keep using whichever LDS buffer the swap parity left it in
       # (no forced buffer 0), unless wider local read needs the offset recomputed.
-      needResetLROffsets = not kernel["1LDSBuffer"] and (not tdm or tdmTailWasWiderLR)
+      needResetLROffsets = not (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel)) \
+                           and (not tdm or tdmTailWasWiderLR)
       # change local read policy from wider local read to one unit of K at a time
       # DirectToVgpr case, use original wider local read instead of recalculating local read address
       if not (kernel["DirectToVgprA"] or kernel["DirectToVgprB"]):
@@ -7329,7 +7429,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # use inc to switch Lds Buffers (instead of using xor)
     self.states.IncLdsBufSwitch = kernel["NumLdsBlk"] >= 3
     # oneBufferScheduling
+    # DirectToLds already earns one-buffer scheduling by holding exactly as many
+    # LDS blocks as the prefetch depth -- no VGPR staging buffer, so the counts
+    # line up. Decoupled PGR reaches the same shape under TDM, which that
+    # condition never covered.
     self.states.oneBufferScheduling = (kernel["1LDSBuffer"]) or \
+                                      decoupledOneBlockBoth(kernel) or \
                                       ((kernel["DirectToLdsA"] or kernel["DirectToLdsB"]) and \
                                        self.states.numLDSBlk == kernel["PrefetchGlobalRead"])
     # common sgprSwap
@@ -7343,7 +7448,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.useCommonSgprSwap = True
     # set memory token by LDS buffer setting
     self.states.memTokenLdsBufferMeta = 4
-    if kernel["1LDSBuffer"]:
+    # A single-buffered tensor reads and refills the same bytes, so the two
+    # buffer tokens must collapse to one or the dependency tracker sees the
+    # refill land on a buffer nothing read and postMainLoopBarrierCheckAndReset
+    # emits no barrier for a real write-after-read. This is the same collapse
+    # 1LDSBuffer already relies on -- the difference is that under decoupled
+    # PGR only one of the two tensors may be single-buffered, and the wave-
+    # separated tensor_load_to_lds is shared between them, so one token has to
+    # cover both. Collapsing is the conservative direction: it can only add
+    # barriers, never remove one that was required.
+    if kernel["1LDSBuffer"] or decoupledSingleBuffered(kernel) or decoupledOneBlockBoth(kernel):
       self.states.memTokenLdsBuffer0 = 0
       self.states.memTokenLdsBuffer1 = 0
       self.states.memTokenLdsSplit = [[1, 2], [1, 2]]
@@ -11277,7 +11391,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
   def tdmIncrementABWaveSperated(self, kernel, tPA, tPB, loopIdx=None, prefetchIndex=0) -> Module:
     assert False, "Should be overrided"
 
-  def tdmSetupIncrementWaveSeparated(self, kernel, tPA, tPB) -> Module:
+  def tdmSetupIncrementWaveSeparated(self, kernel, tPA, tPB, zeroTc=None) -> Module:
     assert False, "Should be overrided"
   
   @abc.abstractmethod

@@ -347,6 +347,57 @@ validParameters = { # we need to make sure this matches develop
     # Need to allocate PGR+1 or PGR LDS buffer
     # Allocating PGR+1 LDS buffer is better for instruction scheduling.
     "PrefetchGlobalRead": [0, 1, 2] + list(range(3,16 + 1)),
+    # Per-tensor LDS block count for A and B, spelled on the PrefetchGlobalRead
+    # scale. The value is not "the scalar's meaning applied to one tensor":
+    # Solution.ldsBlocksForPgrLevel is the one place that reads it, and it reads
+    # a *block count*.
+    #   0  no global-read prefetch for this tensor, one LDS block
+    #   1  prefetch,                                one LDS block
+    #   2  prefetch,                                two LDS blocks (ping-pong)
+    #   k  k LDS blocks, matching the scalar derivation from level 3 up
+    # Level 1 is the rung that does not line up with the scalar, which allocates
+    # TWO blocks for PrefetchGlobalRead=1. So the pairs that reduce to a legacy
+    # configuration are
+    #   (0,0)  ==  PrefetchGlobalRead=0
+    #   (1,1)  ==  one LDS block per tensor, allocated directly. Emits the same
+    #              instructions as PrefetchGlobalRead=1 + 1LDSBuffer=1 at SIA 2
+    #              or 3, but does not set that parameter and is not restricted
+    #              to those ScheduleIterAlgs.
+    #   (2,2)  ==  PrefetchGlobalRead=2
+    # each byte-identical to its legacy counterpart in both the instruction
+    # stream and the LDS total; _pgr/impl_v2/pgr_regress.sh asserts those three.
+    # These two have no entry in defaultBenchmarkCommonParameters: a solution
+    # that does not mention them does not carry the key, and an absent key means
+    # "not specified, use the scalar PrefetchGlobalRead". 0 is therefore a real
+    # value -- one LDS block -- and not a "not active" sentinel.
+    # What the pair buys is divergent counts, (1,2) and (2,1): one tensor on a
+    # single LDS block, the other double-buffered. LDS replication is grouped by
+    # owner: A carries its MX scales (MXSA) and B carries its MX scales (MXSB),
+    # because double-buffering a tile without its scale factors would let tile
+    # N+1's scales overwrite tile N's.
+    # PrefetchGlobalRead is pinned by the pair, because the unrolled loop
+    # skeleton is still emitted from the scalar. It must equal
+    #   min(max(A, B), min(blocks(A), blocks(B)))
+    # where blocks() is Solution.ldsBlocksForPgrLevel. The skeleton is never
+    # deeper than any tensor asked for, and never deeper than the number of LDS
+    # blocks the shallowest tensor holds -- the prologue issues one fill round
+    # per level with nothing consuming between them. For equal levels that is
+    # just max(A, B); divergent block counts drop to the shallower envelope.
+    # Two limits of this increment, so nobody reads more into a value than the
+    # code puts there:
+    #  - Only the LDS depth is per-tensor. Prefetch *cadence* is not
+    #    (AIHPBLAS-4159): loop depth is one scalar, and under wave-separated TDM
+    #    one shared instruction loads both tensors. Levels 0 and 1 select the
+    #    same block count and, at the shapes this supports, emit identical
+    #    kernels -- (0,2) and (1,2) differ by zero instructions. Solution warns
+    #    when two different levels resolve to the same block count, which does
+    #    not cover the (0,2)-versus-(1,2) case because that pair is divergent.
+    #  - Above two blocks only equal levels are reachable: a divergent pair with
+    #    more than two blocks on either side is rejected, and (k,k) for k >= 3
+    #    leaves the layout entirely to the legacy scalar path. Nothing here
+    #    exercises k >= 3.
+    "PrefetchGlobalReadA": [0, 1, 2] + list(range(3,16 + 1)),
+    "PrefetchGlobalReadB": [0, 1, 2] + list(range(3,16 + 1)),
     # number of iteration prefetch local reads from lds to VGPRs buffer = PLR
     "PrefetchLocalRead": list(range(128 + 1)),
     # Enable global memory to GL2 cache prefetch using global_prefetch_b8 instruction (gfx1250 only).
