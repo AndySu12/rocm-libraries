@@ -209,10 +209,6 @@ class TestMultipleB32TrueBranch:
             assert "KernelWriter.py" in deepest.filename, (
                 f"Deepest frame not in KernelWriter.py: {deepest.filename}"
             )
-            # linecache is a process-global, filename-keyed cache shared with
-            # inspect.getsource.  A stale entry returns the pre-edit source line
-            # for a file some earlier test already cached, so invalidate first.
-            linecache.checkcache(deepest.filename)
             src_line = linecache.getline(deepest.filename, deepest.lineno)
             assert "SAndBX = SAndB64" in src_line, (
                 f"Expected exception at the SAndBX statement inside the if-block, "

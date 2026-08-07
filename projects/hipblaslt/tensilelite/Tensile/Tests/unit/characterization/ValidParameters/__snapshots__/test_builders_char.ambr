@@ -1461,8 +1461,6 @@
     'PrefetchAcrossPersistent',
     'PrefetchGL2',
     'PrefetchGlobalRead',
-    'PrefetchGlobalReadA',
-    'PrefetchGlobalReadB',
     'PrefetchLocalRead',
     'PreloadKernArgs',
     'SFCWGM',
@@ -2420,24 +2418,6 @@
       'type': 'list',
     }),
     'PrefetchGlobalRead': dict({
-      'head': list([
-        0,
-        1,
-        2,
-      ]),
-      'len': 17,
-      'type': 'list',
-    }),
-    'PrefetchGlobalReadA': dict({
-      'head': list([
-        0,
-        1,
-        2,
-      ]),
-      'len': 17,
-      'type': 'list',
-    }),
-    'PrefetchGlobalReadB': dict({
       'head': list([
         0,
         1,
