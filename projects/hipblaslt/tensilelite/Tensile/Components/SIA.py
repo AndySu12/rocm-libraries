@@ -75,7 +75,10 @@ class SIA3(SIA):
         if not writer.states.scheduleLocalWrite:
             noSchedLocalWrite(writer, kernel, tensorParametersA, tensorParametersB, localWriteEndIter)
             writer.states.lwStartMfmaIndex = writer.states.lwEndMfmaIndex
-            if kernel["1LDSBuffer"] or kernel["DirectToLds"]:
+            # Imported here rather than at module scope: SolutionStructs.Solution
+            # imports ..Component, which imports this module.
+            from ..SolutionStructs import decoupledOneBlockBoth
+            if kernel["1LDSBuffer"] or kernel["DirectToLds"] or decoupledOneBlockBoth(kernel):
                 writer.states.sync1LdsMfmaIndex = max(writer.states.lwStartMfmaIndex - 1, 0)
         else:
             itemsLWToSched, numWritesToSched = prepareLWInstToSched(writer, kernel, numLocalWritesPerSched, isNGLL=isNGLL)
@@ -980,7 +983,10 @@ def assignLWSchedIndexSIA3(writer, kernel, numLocalWritesPerSched, localWriteEnd
     if writer.states.lwStartMfmaIndex < writer.states.grEndMfmaIndex:
           # adjust lwStartMfmaIndex for PGR1
           writer.states.lwStartMfmaIndex = writer.states.grEndMfmaIndex
-    if kernel["1LDSBuffer"] or kernel["DirectToLds"]:
+    # Imported here rather than at module scope: SolutionStructs.Solution
+    # imports ..Component, which imports this module.
+    from ..SolutionStructs import decoupledOneBlockBoth
+    if kernel["1LDSBuffer"] or kernel["DirectToLds"] or decoupledOneBlockBoth(kernel):
         writer.states.sync1LdsMfmaIndex = max(writer.states.lwStartMfmaIndex - 1, 0)
     startIter = writer.states.lwStartMfmaIndex//numMfmaPerIter
     assert startIter < localWriteEndIter+1 # startIter should be at or before the endIter
