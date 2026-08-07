@@ -5038,23 +5038,31 @@ class Solution(collections.abc.Mapping):
                "over-fills a single-buffered tensor)")
         return
       if numLdsBlkA != numLdsBlkB:
-        # Divergent counts are the case the feature exists for, and they are the
-        # case that is not finished. One tensor would have to load the tile the
-        # current iteration consumes while the other loads one iteration ahead,
-        # inside a single unrolled loop, and that per-tensor cadence is not
-        # implemented. Without it the kernel builds and silently computes wrong
-        # results once K reaches 2*DepthU, so this has to be a reject rather
-        # than a warning.
-        reject(state, printRejectionReason,
-               "PrefetchGlobalReadA/B: per-tensor LDS block counts must match for now "
-               "(got A=%u block(s), B=%u block(s)). Divergent counts need per-tensor "
-               "prefetch cadence in the unrolled loop -- one tensor loading the tile the "
-               "current iteration consumes while the other loads one ahead -- which is not "
-               "implemented yet; a kernel built that way computes wrong results once "
-               "K >= 2*DepthU. Supported today: PrefetchGlobalReadA == PrefetchGlobalReadB, "
-               "i.e. (1,1) and (2,2). Tracking: AIHPBLAS-4159."
-               % (numLdsBlkA, numLdsBlkB))
-        return
+        # Divergent counts are what the feature exists for. A single-buffered
+        # tensor is legal because its fill is moved inside the unrolled loop to
+        # the sub-iteration carrying the pre-read sync, after that iteration's
+        # last local read of the block and before the prefetched read that opens
+        # the next one (KernelWriter._dcpScheduleSingleBufferedFillLate). That
+        # slot only exists under the shapes below; outside them there is nowhere
+        # to move the fill to and the kernel would compute wrong results from
+        # K = 2*DepthU, so those stay a reject rather than a silent wrong answer.
+        dcpUnsupported = None
+        if max(numLdsBlkA, numLdsBlkB) > 2:
+          dcpUnsupported = "more than two LDS blocks for a tensor is not supported"
+        elif not (state["enableTDMA"] and state["enableTDMB"]):
+          dcpUnsupported = "both tensors must move data with the TDM (TDMInst == 3)"
+        elif state["ScheduleIterAlg"] != 0:
+          dcpUnsupported = "only ScheduleIterAlg=0 places the fill where it can be moved"
+        elif state["PrefetchLocalRead"] < 1:
+          dcpUnsupported = ("PrefetchLocalRead must be at least 1 so a sub-iteration exists "
+                            "between the last local read and the pre-read sync")
+        if dcpUnsupported:
+          reject(state, printRejectionReason,
+                 "PrefetchGlobalReadA/B: divergent per-tensor LDS block counts (A=%u, B=%u) "
+                 "need a slot in the unrolled loop to move the single-buffered tensor's fill "
+                 "into, and this solution has none: %s. Tracking: AIHPBLAS-4159."
+                 % (numLdsBlkA, numLdsBlkB, dcpUnsupported))
+          return
       if state["PrefetchGlobalRead"] != pgrLoop:
         # The loop skeleton is still emitted from PrefetchGlobalRead. Until the
         # envelope is threaded through KernelWriter, any mismatch would allocate
