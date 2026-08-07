@@ -358,9 +358,14 @@ validParameters = { # we need to make sure this matches develop
     # LDS replication is grouped by owner: A carries its MX scales (MXSA) and B
     # carries its MX scales (MXSB), because double-buffering a tile without its
     # scale factors would let tile N+1's scales overwrite tile N's.
-    # PrefetchGlobalRead must equal max(PrefetchGlobalReadA, PrefetchGlobalReadB):
-    # the unrolled loop skeleton is still emitted from the scalar, so it has to
-    # name the deepest tensor's level.
+    # PrefetchGlobalRead is pinned by the pair, because the unrolled loop
+    # skeleton is still emitted from the scalar. It must equal
+    #   min(max(A, B), min(blocks(A), blocks(B)))
+    # where blocks() is Solution.ldsBlocksForPgrLevel. The skeleton is never
+    # deeper than any tensor asked for, and never deeper than the number of LDS
+    # blocks the shallowest tensor holds -- the prologue issues one fill round
+    # per level with nothing consuming between them. For equal levels that is
+    # just max(A, B); divergent block counts drop to the shallower envelope.
     "PrefetchGlobalReadA": [0, 1, 2] + list(range(3,16 + 1)),
     "PrefetchGlobalReadB": [0, 1, 2] + list(range(3,16 + 1)),
     # number of iteration prefetch local reads from lds to VGPRs buffer = PLR

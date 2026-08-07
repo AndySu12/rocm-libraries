@@ -5022,18 +5022,37 @@ class Solution(collections.abc.Mapping):
       state["PrefetchGlobalReadA"] = pgrA
       state["PrefetchGlobalReadB"] = pgrB
       # PrefetchGlobalRead still drives the pipelined loop skeleton (pre-loop
-      # prologue, NoLoadLoop/NGLL copies, issue position, sync shape), and that
-      # skeleton is one shared shape, so it has to be the deepest tensor's
-      # level. Rejecting rather than silently rewriting a serialized, named
-      # parameter keeps the solution the user wrote and the solution that gets
-      # built the same thing.
-      if state["PrefetchGlobalRead"] != max(pgrA, pgrB):
+      # prologue rounds, NoLoadLoop/NGLL copies, issue position, sync shape) and
+      # that skeleton is one shared shape, so the scalar has to be pinned to a
+      # single value. What pins it is a *depth* bound, not equality with the
+      # deepest level. The prologue issues PrefetchGlobalRead fill rounds back to
+      # back before the loop -- round 0 in setupNewTile, rounds 1..PGR-1 in
+      # openPrefetchGlobalRead2orMore -- with no consumer between them, so a
+      # tensor holding N LDS blocks can retire at most N rounds before round
+      # N+1 overwrites a tile the no-load loops still have to read. The
+      # *shallowest* tensor therefore caps the skeleton. The deepest tensor's
+      # block count is an LDS-bytes constraint, and setLdsOffsetsDecoupled
+      # already satisfies that per-tensor without reading the scalar at all.
+      # max(pgrA, pgrB) survives only as the other cap: the skeleton is never
+      # deeper than any tensor asked for. For equal levels the two caps coincide
+      # with max(pgrA, pgrB), so (0,0), (1,1), (2,2) and (k,k) pin exactly the
+      # scalar they pinned before and stay byte-identical to their legacy
+      # counterparts. Only divergent block counts move, and they move down to
+      # the envelope their single-block side can actually serve.
+      # Rejecting rather than silently rewriting a serialized, named parameter
+      # keeps the solution the user wrote and the solution that gets built the
+      # same thing.
+      pgrSkeleton = min(max(pgrA, pgrB), min(numLdsBlkA, numLdsBlkB))
+      if state["PrefetchGlobalRead"] != pgrSkeleton:
         reject(state, printRejectionReason,
-               "PrefetchGlobalReadA/B: PrefetchGlobalRead=%u must equal "
-               "max(PrefetchGlobalReadA=%u, PrefetchGlobalReadB=%u)=%u, because the unrolled "
-               "loop is still emitted from the scalar level and has to be the deepest "
-               "tensor's. Tracking: AIHPBLAS-4159."
-               % (state["PrefetchGlobalRead"], pgrA, pgrB, max(pgrA, pgrB)))
+               "PrefetchGlobalReadA/B: PrefetchGlobalRead=%u must equal %u for "
+               "PrefetchGlobalReadA=%u (%u LDS block(s)) and PrefetchGlobalReadB=%u "
+               "(%u LDS block(s)): the unrolled loop is emitted from the scalar level, "
+               "its prologue issues one fill round per level, and that depth cannot "
+               "exceed the number of LDS blocks the shallowest tensor holds. "
+               "Tracking: AIHPBLAS-4159."
+               % (state["PrefetchGlobalRead"], pgrSkeleton, pgrA, numLdsBlkA,
+                  pgrB, numLdsBlkB))
         return
       if pgrA != pgrB and numLdsBlkA == numLdsBlkB:
         # Different levels that land on the same block count (0 and 1) differ in
@@ -5127,9 +5146,13 @@ class Solution(collections.abc.Mapping):
       # single shared buffer, so pin 1LDSBuffer. Without this an unresolved -1
       # could auto-resolve to 1 further down and overwrite the decoupled offsets.
       state["1LDSBuffer"] = 0
-      # numLdsBlk needs no override. PrefetchGlobalRead is pinned to
-      # max(pgrA, pgrB) above and ldsBlocksForPgrLevel is monotonic, so the
-      # scalar derivation has already produced max(numLdsBlkA, numLdsBlkB).
+      # numLdsBlk needs no override. A divergent pair pins the scalar to
+      # min(numLdsBlkA, numLdsBlkB) above, which is 1 or 2 whenever either side
+      # is at level 0 or 1, and the legacy derivation maps both of those (with
+      # 1LDSBuffer forced to 0 just above) to two blocks -- already
+      # max(numLdsBlkA, numLdsBlkB). numLdsBlk is not what lays out a divergent
+      # solution in any case; setLdsOffsetsDecoupled uses the two per-tensor
+      # counts directly.
 
     def setLdsOffsets(offsetBlk, numLdsBlk, ldsNumBytesB):
       if numLdsBlk <= 1:
