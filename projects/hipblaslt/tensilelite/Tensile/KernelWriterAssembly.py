@@ -78,7 +78,7 @@ from .Components.GL2Prefetch import GL2PrefetchLoad
 from .Components.GlobalWriteBatch import GlobalWriteBatchWriter
 from .KernelWriterModules import *
 from .AsmMemoryHelpers import dsStore, dsLoad, _vgprOffset
-from .SolutionStructs import isPackedIndex, decouplePgrBlocks, decoupledSingleBuffered
+from .SolutionStructs import isPackedIndex, decouplePgrBlocks, decoupledSingleBuffered, decoupledOneBlockBoth
 from .AsmStoreState import StoreState, VectorDataTypes
 from .Activation import ActivationType
 from .CustomKernels import isCustomKernelConfig
@@ -11999,7 +11999,8 @@ class KernelWriterAssembly(KernelWriter):
     tc: str = tP["tensorChar"]
     strippedTc: str = tc[-1]
     oppositeStrippedTc = "A" if strippedTc == "B" else "B"
-    needSwap: bool = not kernel["1LDSBuffer"]
+    # A single-block tensor has no second copy to swap into.
+    needSwap: bool = not (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel))
 
     if not needSwap:
       return Module("TDM LDS swap (Empty)")
@@ -13142,7 +13143,7 @@ class KernelWriterAssembly(KernelWriter):
     tc=tP["tensorChar"]
     if (not self.do["LocalRead%s"%tc]):
       return Module("localReadSwapOffsets (no local read)")
-    if kernel["1LDSBuffer"] or ((tc in ("A", "B", "MXSA", "MXSB")) and kernel["DirectToVgpr%s"%tc]): # no local read code if DirectToVgpr is enabled
+    if kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel) or ((tc in ("A", "B", "MXSA", "MXSB")) and kernel["DirectToVgpr%s"%tc]): # no local read code if DirectToVgpr is enabled
       return Module("localReadSwapOffsets (Empty)")
     module = Module("localReadSwapOffsets")
 
@@ -13221,7 +13222,7 @@ class KernelWriterAssembly(KernelWriter):
     if not self.do["LocalRead%s"%tc]:
       return Module("localReadResetOffsets (no local read)")
     # no local read code if DirectToVgpr is enabled
-    if kernel["1LDSBuffer"] or ((tP["isA"] or tP["isB"] or tP["isMXSA"] or tP["isMXSB"]) and kernel["DirectToVgpr%s"%tc]):
+    if kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel) or ((tP["isA"] or tP["isB"] or tP["isMXSA"] or tP["isMXSB"]) and kernel["DirectToVgpr%s"%tc]):
       return Module("localReadResetOffsets (Empty)")
     module = Module("localReadResetOffsets")
     if tP["localReadInstruction"].numOffsets == 1:
@@ -20350,7 +20351,7 @@ class KernelWriterAssembly(KernelWriter):
     needLdsReset = (kernel["StreamK"] or
                     self.states.numReadsIterCoalescedA > 1 or
                     self.states.numReadsIterCoalescedB > 1)
-    if not kernel["1LDSBuffer"] and needLdsReset:
+    if not (kernel["1LDSBuffer"] or decoupledOneBlockBoth(kernel)) and needLdsReset:
       mod.addComment("TDM tail: reset LDS write addr to buffer 0 (matches recalculated local-read ptr)")
       mod.add(self.tdmResetTailLdsBuffer(kernel, comp.getLdsAddrSgprName(descSgprName(0))))
 
