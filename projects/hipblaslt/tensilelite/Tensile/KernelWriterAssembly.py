@@ -11881,10 +11881,12 @@ class KernelWriterAssembly(KernelWriter):
   def _dcpDivergent(self, kernel):
     """True only when A and B carry different LDS block counts.
 
-    Always False in a shipping configuration: Solution.py rejects divergent
-    counts. Every path guarded by this predicate -- the decoupled TDM swap, the
-    per-tensor swap strides at the four addressing sites -- is therefore
-    unreachable, and is kept as the basis for AIHPBLAS-4159 rather than deleted.
+    True when exactly one tensor is at PrefetchGlobalRead level 0, since levels 1
+    and 2 both allocate two blocks. The paths guarded by this predicate -- the
+    decoupled TDM swap and the per-tensor swap strides at the four addressing
+    sites -- are the unfinished part of AIHPBLAS-4159; they emit, but per-tensor
+    runtime addressing is not complete, so a divergent kernel can compute wrong
+    results once K reaches 2*DepthU.
 
     With equal counts the layout degenerates to legacy's copy-grouped single
     power-of-two stride, so the legacy emit shape is not merely acceptable, it

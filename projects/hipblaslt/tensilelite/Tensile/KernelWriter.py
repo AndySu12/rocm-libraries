@@ -3167,11 +3167,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
         # increment register, so the per-tensor lever above (tP=None) is asserted
         # out for NumWaves>1; hold the pointer by re-selecting that register with
         # the exhausted side zeroed, then restore it before the main loop.
-        # Unreachable since divergent block counts became a reject: the
-        # condition below needs (pfi >= dcpBlkA) != (pfi >= dcpBlkB), which
-        # requires the counts to differ.  It did emit before the reject (removing
-        # it changed hero and mirror assembly), and it is kept for the same
-        # reason as the divergent layout: AIHPBLAS-4159 needs it.
+        # Reached only when the two tensors resolve to different block counts,
+        # i.e. exactly one of them is at PrefetchGlobalRead level 0: the condition
+        # below needs (pfi >= dcpBlkA) != (pfi >= dcpBlkB).  The hold is part of
+        # the unfinished per-tensor cadence work (AIHPBLAS-4159) and is not on its
+        # own sufficient for a correct divergent kernel.
         dcpRound, dcpBlkA, dcpBlkB = decouplePgrBlocks(kernel)
         dcpHoldTc = None
         if dcpRound and tdmA and tdmB and kernel["NumWaves"] > 1 \
