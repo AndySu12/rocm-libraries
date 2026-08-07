@@ -108,8 +108,8 @@ def getRequiredParametersMin() -> set:
         'OptNoLoadLoop',
         'PrefetchAcrossPersistent',
         'PrefetchGlobalRead',
-        'PrefetchGlobalReadA',
-        'PrefetchGlobalReadB',
+        # PrefetchGlobalReadA/B are added to the name only when the solution
+        # actually carries them, in Naming._getName; see the comment there.
         'PrefetchLocalRead',
         'PrefetchGL2',
         'PreloadKernArgs',
