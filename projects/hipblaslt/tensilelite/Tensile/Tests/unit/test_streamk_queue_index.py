@@ -38,7 +38,6 @@ Invariants pinned (see per-test notes):
 
 import ast
 import inspect
-import linecache
 import textwrap
 import types
 
@@ -320,10 +319,6 @@ class TestUsesRawQueueRankScoping:
 # AST helpers: read the *real* KernelWriter / KernelWriterAssembly source.
 # ---------------------------------------------------------------------------
 def _source_of(func) -> str:
-    # inspect.getsource reads through the process-global, filename-keyed
-    # linecache.  Invalidate first so a stale entry cached by an earlier test
-    # cannot yield pre-edit source.
-    linecache.checkcache()
     return inspect.getsource(func)
 
 
