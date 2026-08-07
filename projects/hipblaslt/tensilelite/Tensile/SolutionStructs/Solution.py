@@ -5047,12 +5047,14 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason,
                "PrefetchGlobalReadA/B: PrefetchGlobalRead=%u must equal %u for "
                "PrefetchGlobalReadA=%u (%u LDS block(s)) and PrefetchGlobalReadB=%u "
-               "(%u LDS block(s)): the unrolled loop is emitted from the scalar level, "
-               "its prologue issues one fill round per level, and that depth cannot "
-               "exceed the number of LDS blocks the shallowest tensor holds. "
+               "(%u LDS block(s)). The unrolled loop is emitted from the scalar level, "
+               "so the pair pins it to one value: never deeper than the deepest level "
+               "asked for (%u), and never deeper than the number of LDS blocks the "
+               "shallowest tensor holds (%u), because the prologue issues one fill "
+               "round per level with nothing consuming between them. "
                "Tracking: AIHPBLAS-4159."
                % (state["PrefetchGlobalRead"], pgrSkeleton, pgrA, numLdsBlkA,
-                  pgrB, numLdsBlkB))
+                  pgrB, numLdsBlkB, max(pgrA, pgrB), min(numLdsBlkA, numLdsBlkB)))
         return
       if pgrA != pgrB and numLdsBlkA == numLdsBlkB:
         # Different levels that land on the same block count (0 and 1) differ in
