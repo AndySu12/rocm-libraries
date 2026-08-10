@@ -481,9 +481,11 @@ defaultBenchmarkCommonParameters = [
     {"UnrollLoopSwapGlobalReadOrder": [0]},
     {"PrefetchGlobalRead": [1]},
     # PrefetchGlobalReadA/B have no entry here on purpose: an absent key is the
-    # "not specified" sentinel, which leaves 0 free to be a real block count. A
-    # default here would put both keys on every solution ever built and rename
-    # every kernel.
+    # "not specified" sentinel, which leaves 0 free to be a real block count.
+    # Measured: defaulting them to 0 makes every solution decoupled, and the
+    # scalar-consistency guard then rejects all of them -- all three golden
+    # configurations emit zero kernels. A -1 sentinel builds, but puts both keys
+    # on every serialized solution and moves three characterization snapshots.
     {"PrefetchLocalRead": [1]},
     {"PrefetchGL2": [0]},
     {"ClusterLocalRead": [1]},
