@@ -78,7 +78,8 @@ from .Components.GL2Prefetch import GL2PrefetchLoad
 from .Components.GlobalWriteBatch import GlobalWriteBatchWriter
 from .KernelWriterModules import *
 from .AsmMemoryHelpers import dsStore, dsLoad, _vgprOffset
-from .SolutionStructs import isPackedIndex, decouplePgrBlocks, decoupledSingleBuffered, decoupledOneBlockBoth
+from .Common.DecouplePgr import decouplePgrBlocks, decoupledSingleBuffered, decoupledOneBlockBoth
+from .SolutionStructs import isPackedIndex
 from .AsmStoreState import StoreState, VectorDataTypes
 from .Activation import ActivationType
 from .CustomKernels import isCustomKernelConfig
@@ -5865,9 +5866,10 @@ class KernelWriterAssembly(KernelWriter):
           # needed for the VReadfirstlaneB32 in the prior code block
           if self.states.archCaps["CrosslaneWait"]:
             module.add(SNop(waitState=0, comment="1 wait states"))
-          # (LWA + stride) ^ LWA is a two-state toggle for any stride, so the
-          # packed per-tensor stride needs no idiom change here, only the right
-          # number: each tensor's second copy sits its own distance away.
+          # Builds a toggle mask at runtime, (LWA + stride) ^ LWA, so it
+          # tolerates a per-tensor stride that is not a power of two. The
+          # inlined xor constant in tdmSwapLdsOffset cannot, which is why the
+          # divergent layout swaps by compare-and-add there instead.
           _lwaBlk = self._decoupledSwapStride(kernel, tc) if self._dcpDivergent(kernel) \
                     else kernel["LdsOffsetA_Blk"]
           module.add(SAddU32(dst=sgpr("Swap%s"%tc), src0=sgpr("LocalWriteAddr%s"%tc), src1=_lwaBlk, comment="Calculate starting lds addr of second buffer"))
@@ -11869,10 +11871,12 @@ class KernelWriterAssembly(KernelWriter):
 
     return imod
 
-  # Group membership for the decoupled-PGR LDS layout: group A is [A | MXSA] with
-  # stride LdsOffsetBlkA, group B is [MXSB | Metadata | B] with stride
-  # LdsOffsetBlkB. The groups can hold different numbers of copies, so no single
-  # delta describes both.
+  # LDS replication is grouped by owner, because double-buffering a tile
+  # without its scale factors would let tile N+1's scales overwrite tile N's:
+  # group A is [A | MXSA] with stride LdsOffsetBlkA, group B is [MXSB | B] with
+  # stride LdsOffsetBlkB. The two groups can hold different numbers of copies,
+  # so no single delta describes both. Metadata maps to B for ordering only and
+  # never contributes bytes here, since Sparse is rejected on this path.
   _tdmDecoupledGroup = {"A": "A", "MXSA": "A", "B": "B", "MXSB": "B", "Metadata": "B"}
   # With NumWaves > 1 the B/MXSB descriptors are RegSet aliases of A/MXSA, so one
   # physical descriptor serves both and only the A/MXSA call sites are reached.
@@ -11881,16 +11885,24 @@ class KernelWriterAssembly(KernelWriter):
   def _dcpDivergent(self, kernel):
     """True only when A and B carry different LDS block counts.
 
-    True when exactly one tensor is at level 0 or 1 (one block) and the other at
-    2 or above. The paths guarded by this predicate -- the
-    decoupled TDM swap and the per-tensor swap strides at the four addressing
-    sites -- are the unfinished part of AIHPBLAS-4159; they emit, but per-tensor
-    runtime addressing is not complete, so a divergent kernel can compute wrong
-    results once K reaches 2*DepthU.
+    The paths this guards are the decoupled TDM swap and the per-tensor swap
+    strides at the four addressing sites. They are correct on gfx1250: (1,2)
+    and (2,1) soak at 1302 passed / 0 failed, against a positive control that
+    still reproduces the pre-fix failure through the same harness.
 
-    With equal counts the layout degenerates to legacy's copy-grouped single
-    power-of-two stride, so the legacy emit shape is not merely acceptable, it
-    is required: it is what reproduces legacy byte for byte.
+    Equal counts must NOT take those paths: they degenerate to legacy's
+    copy-grouped single power-of-two stride, and taking the legacy shape
+    verbatim is what reproduces legacy byte for byte.
+
+    One equal-count spelling is broken, and deliberately not routed here to be
+    fixed. Symmetric one-block, PrefetchGlobalReadA/B = (1,1), computes wrong
+    results from K = 2*DepthU (10 passed / 12 failed). That is pre-existing and
+    not this feature's: the legacy spelling PrefetchGlobalRead=1 with
+    1LDSBuffer=1 fails identically on an unpatched tree. The late-fill
+    relocation that makes the divergent shapes correct cannot reach it either,
+    because the slot it moves the fill into only exists while the *other*
+    tensor is double-buffered and keeps the pipeline fed, and (1,1) has no such
+    partner. See _dcpScheduleSingleBufferedFillLate.
     """
     decoupled, numLdsBlkA, numLdsBlkB = decouplePgrBlocks(kernel)
     return decoupled and numLdsBlkA != numLdsBlkB
@@ -11904,10 +11916,12 @@ class KernelWriterAssembly(KernelWriter):
     return numLdsBlkB, kernel["LdsOffsetBlkB"]
 
   def _decoupledSwapStride(self, kernel, tc):
-    """Byte distance between a tensor's two LDS copies, or 0 if it has only one.
+    """Byte distance between a tensor's two LDS copies.
 
-    Used by every addressing site that would otherwise reach for the single
-    whole-block LdsOffsetA_Blk, which cannot describe two groups at once.
+    Zero for a single-buffered tensor: it has no second copy to toggle to, so
+    every swap idiom built on this delta becomes a no-op, which is exactly the
+    wanted behaviour. Used by the addressing sites that would otherwise reach
+    for LdsOffsetA_Blk, which cannot describe two groups at once.
     """
     numBlk, stride = self._tdmDecoupledBlocks(kernel, tc)
     return stride if numBlk >= 2 else 0
@@ -11915,10 +11929,10 @@ class KernelWriterAssembly(KernelWriter):
   def _tdmDecoupledSwapArm(self, kernel, tc, ldsAddrSgprName, tmpSgprIdx) -> Module:
     """Toggle one tensor's descriptor between its two LDS copies.
 
-    The comparison is against the tensor's own second-copy base, not against the
-    delta. A descriptor holds LdsOffset<tc> + waveOffset, so comparing against
-    the delta only happens to work while the tensor's base is below it, which
-    stops being true once each group carries its own stride.
+    Compare against the tensor's own second-copy base, not against the delta: a
+    descriptor holds LdsOffset<tc> + waveOffset, so comparing against the delta
+    only works while the tensor's base is below it, which stops being true once
+    each group carries its own stride.
     """
     numBlk, stride = self._tdmDecoupledBlocks(kernel, tc)
     module = Module(f"TDM LDS swap {tc}")
@@ -11926,11 +11940,9 @@ class KernelWriterAssembly(KernelWriter):
       module.addComment0(f"TDM decoupled swap {tc}: single-buffered, no swap")
       return module
     secondCopyBase = kernel[f"LdsOffset{tc}"] + stride
-    # Cross-check the recorded key against the address actually emitted, so the
-    # two cannot drift. setLdsOffsetsDecoupled only records LdsOffset<tc>_Blk for
-    # a group that has a second copy, and numBlk >= 2 here means this one does,
-    # so the key must be present and must agree. A is exempt: LdsOffsetA_Blk is
-    # the overloaded whole-block swap stride, not A's second-copy base.
+    # Cross-check the recorded key against the address actually emitted so the
+    # two cannot drift. A is exempt: LdsOffsetA_Blk is the overloaded
+    # whole-block swap stride, not A's second-copy base.
     if tc != "A":
       assert kernel[f"LdsOffset{tc}_Blk"] == secondCopyBase, \
         f"LdsOffset{tc}_Blk={kernel[f'LdsOffset{tc}_Blk']} disagrees with the " \
@@ -11946,12 +11958,10 @@ class KernelWriterAssembly(KernelWriter):
   def _tdmSwapLdsOffsetDecoupled(self, kernel, tP, ldsAddrSgprName) -> Module:
     """TDM LDS swap when PrefetchGlobalReadA/B give the tensors separate layouts.
 
-    Wave-parity aware rather than un-aliased: the shared descriptor already holds
-    A's address on even waves and B's on odd waves, and the kernel already
-    branches on that same parity to program it, so each parity can simply apply
-    its own tensor's rule. Un-aliasing would instead cost 12 SGPRs for B plus 12
-    for MXSB and require re-plumbing every tensor_load_to_lds and the parity-
-    separated descriptor init, with no addressing benefit.
+    Wave-parity aware rather than un-aliased: the shared descriptor already
+    holds A's address on even waves and B's on odd, so each parity can apply
+    its own tensor's rule. Un-aliasing would cost 12 SGPRs for B plus 12 for
+    MXSB and a re-plumb of every tensor_load_to_lds, for no addressing benefit.
     """
     tc: str = tP["tensorChar"]
     aliased = kernel["NumWaves"] > 1 and not kernel.get("UseSubtileImpl")
@@ -20297,9 +20307,10 @@ class KernelWriterAssembly(KernelWriter):
     tcB: str = tpB["tensorChar"]
     wavelen: int = kernel["WavefrontSize"]
     incSgprName = f"tdm{tcA}{tcB}Incs"
-    # zeroTc pins one tensor's pointer for a prefetch round that is not refilling
-    # it.  Zeroing one side of the select keeps the shared parity structure
-    # intact rather than adding a branch (cf. graIncrementMask).
+    # zeroTc pins one tensor's pointer for a round that is not refilling it, by
+    # zeroing one side of the select rather than adding a branch. No caller
+    # passes it: decoupled PGR advances both tensors and moves the fill
+    # instead. Kept for the per-tensor cadence increment (AIHPBLAS-4159).
     srcOdd = 0 if zeroTc == tcB else sgpr(f"GlobalReadIncs{tcB}")
     srcEven = 0 if zeroTc == tcA else sgpr(f"GlobalReadIncs{tcA}")
     mod.add(SBitcmp1B32(sgpr("WaveIdx"), 0, "Check parity of wId"))

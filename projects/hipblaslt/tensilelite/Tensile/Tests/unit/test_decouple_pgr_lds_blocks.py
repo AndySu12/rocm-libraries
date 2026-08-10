@@ -24,25 +24,21 @@
 ################################################################################
 """Block-count map behind PrefetchGlobalReadA/B ("Decouple PGR", AIHPBLAS-4159).
 
-``ldsBlocksForPgrLevel`` decides the whole LDS budget of a decoupled solution,
-and the direction of its level-1 rung has been reversed twice. Nothing else
-pins it down: the byte totals it produces are only asserted by out-of-tree
-build scripts, so a silent change of the map is a silent change of every
-decoupled kernel's LDS footprint.
+``ldsBlocksForPgrLevel`` decides the whole LDS budget of a decoupled solution
+and nothing else in-tree pins it down, so a silent change to the map is a
+silent change to every decoupled kernel's LDS footprint.
 """
 import pytest
 
-from Tensile.SolutionStructs.Solution import (
+from Tensile.Common.DecouplePgr import (
     decouplePgrBlocks,
     decoupledSingleBuffered,
     ldsBlocksForPgrLevel,
 )
 
 
-# The per-tensor value is a block count, not a loop level: 0 and 1 are both a
-# single block (1 prefetches into it, 0 does not), 2 is the conventional
-# ping-pong pair, and 3 and up are taken literally the way the scalar
-# derivation takes them.
+# A block count, not a loop level: 0 and 1 are both a single block (1
+# prefetches into it, 0 does not), 2 is the ping-pong pair.
 @pytest.mark.parametrize(
     "level, blocks",
     [
@@ -57,9 +53,8 @@ def test_lds_blocks_for_pgr_level(level, blocks):
     assert ldsBlocksForPgrLevel(level) == blocks
 
 
-# (decoupled, blocksA, blocksB). Absence of both keys is the "not specified"
-# sentinel and falls back to the scalar; a single absent key falls back to the
-# scalar for that tensor only.
+# (decoupled, blocksA, blocksB). An absent key falls back to the scalar, for
+# that tensor only.
 @pytest.mark.parametrize(
     "pgr, pgrA, pgrB, expected",
     [
@@ -85,9 +80,9 @@ def test_decouple_pgr_blocks(pgr, pgrA, pgrB, expected):
     assert decouplePgrBlocks(ks) == expected
 
 
-# The write-after-read barriers fire for a one-block tensor sharing a loop with
-# a two-block one. Equal counts do not need them: one block each pins
-# 1LDSBuffer, whose own barrier covers it, and two blocks each ping-pong.
+# Only a one-block tensor sharing a loop with a two-block one needs the
+# write-after-read barriers. Equal counts do not: one block each is covered by
+# decoupledOneBlockBoth, two blocks each ping-pong.
 @pytest.mark.parametrize(
     "pgrA, pgrB, single",
     [

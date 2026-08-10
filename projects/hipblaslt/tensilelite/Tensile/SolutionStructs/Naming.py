@@ -225,15 +225,6 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
   if state.get("LDSSegmentInterleave") == 1:
     requiredParametersTemp.add("LDSSegmentInterleave")
 
-  # Per-tensor PrefetchGlobalRead is named only when the solution asked for it.
-  # The keys have no default, so a solution that never mentioned them does not
-  # carry them and every pre-existing kernel name stays byte-identical. Both
-  # tokens are requested together because assignDerivedParameters resolves and
-  # stores both as soon as either one is present.
-  if "PrefetchGlobalReadA" in state or "PrefetchGlobalReadB" in state:
-    requiredParametersTemp.add("PrefetchGlobalReadA")
-    requiredParametersTemp.add("PrefetchGlobalReadB")
-
   for key in sorted(requiredParametersTemp):
     if key not in state or key == "CustomKernelName":
       continue

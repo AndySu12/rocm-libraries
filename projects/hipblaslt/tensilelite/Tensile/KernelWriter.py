@@ -50,7 +50,8 @@ from .Components.Signature import UserArgumentsInfo
 from .Components.CustomSchedule import customMainLoopSchedule
 from .Components.StreamK import streamKVariantClass
 from .Components.Subtile.Kernel import *
-from .SolutionStructs import Solution, isPackedIndex, decoupledSingleBuffered, decouplePgrBlocks, decoupledOneBlockBoth
+from .Common.DecouplePgr import decouplePgrBlocks, decoupledSingleBuffered, decoupledOneBlockBoth
+from .SolutionStructs import Solution, isPackedIndex
 from .SolutionStructs.Utilities import getMiInputType
 from .AsmMemoryInstruction import MemoryInstruction
 from .Activation import ActivationModule
@@ -706,33 +707,33 @@ class KernelWriter(metaclass=abc.ABCMeta):
   ##############################################################################
   # Decouple PGR: re-slot a single-buffered tensor's fill inside the loop body.
   #
-  # At loop envelope 1 the body issues its fill at the top of the iteration for
-  # the tile the *next* iteration consumes, and the tile this iteration consumes
-  # sits in the other LDS block. A tensor with one block has no other block, so
-  # that fill lands on the bytes this iteration is still reading. The window a
-  # single block does have is between the iteration's last local read of the
-  # block and the prefetched read that opens the next iteration, which is the
-  # sub-iteration carrying the pre-read sync (LoopIters - numItersPLR). Moving
-  # the fill there is what makes one block legal without changing the pipeline
-  # for the other tensor.
+  # The body's fill sits at the top of the iteration and targets the tile the
+  # *next* iteration consumes, which is legal only because that tile lands in
+  # the other LDS block. A one-block tensor has no other block, so its fill
+  # would land on the bytes this iteration is still reading. Its one legal
+  # window is between the iteration's last local read of the block and the
+  # prefetched read that opens the next one, i.e. sub-iteration
+  # LoopIters - numItersPLR.
   #
-  # The load and its increment are already wave-parity separated: one shared
-  # tensor_load_to_lds whose descriptor resolves to A on even waves and B on
-  # odd. So both slots emit the same module under complementary parity guards
-  # and every wave still issues exactly one fill and one advance per iteration.
-  # Round counts, the post-loop pointer, the NoLoadLoop and the tail are
-  # therefore all unchanged; only where one tensor's fill sits inside the
-  # iteration moves. That is also why no round has to be added to the peel or
-  # the NoLoadLoop: the last body iteration's late fill already delivers the
-  # tile the NoLoadLoop reads.
+  # Both slots emit the same module under complementary wave-parity guards,
+  # which works because the load and its increment are already parity
+  # separated: one shared tensor_load_to_lds resolving to A on even waves and B
+  # on odd. Every wave still issues exactly one fill and one advance per
+  # iteration, so round counts, the post-loop pointer, the NoLoadLoop and the
+  # tail are all unchanged -- the last body iteration's late fill already
+  # delivers the tile the NoLoadLoop reads.
+  #
+  # This reaches divergent pairs only, and cannot be extended to a pair where
+  # both tensors are one-block: the window above exists because the other
+  # tensor is double-buffered and keeps the pipeline fed across the move, and
+  # (1,1) has no such partner. (1,1) is broken for that reason and it is
+  # pre-existing -- see _dcpDivergent.
   ##############################################################################
   def _dcpScheduleSingleBufferedFillLate(self, kernel):
     if not self._dcpDivergent(kernel):
       return
-    # At SIA0 with PrefetchGlobalRead=1 the body's fill is not distributed over
-    # sub-iterations; noSchedGlobalRead parks the whole group in the unrolled
-    # loop header, which _loopBody emits at the top of the body. That group is
-    # what has to be duplicated. A copy of the loop body that carries no fill
+    # noSchedGlobalRead parks the whole fill group in the unrolled loop header,
+    # so that is the group to duplicate. A body copy carrying no fill
     # (NoLoadLoop, NGLL) has nothing to move.
     src = self.codes.unrollLoopHeader
     if src is None or not src.itemsSize():
@@ -764,11 +765,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
           self._emitTdmWaveParitySCC(mod, kernel, tmp.idx, "check wave parity")
 
     late = Module("TDM decoupled late fill %s" % singleTc)
-    # Every wave reads the single-buffered block during this iteration, so the
-    # refill is a write-after-read against the whole workgroup and not just this
-    # wave. Close it here; the sync already sitting at the head of this
-    # sub-iteration is what closes the read-after-write against the next
-    # iteration's prefetched read.
+    # Every wave reads the single-buffered block this iteration, so the refill
+    # is a write-after-read against the whole workgroup, not just this wave.
+    # The read-after-write against the next iteration's prefetched read is
+    # closed by the sync already at the head of this sub-iteration.
     late.add(SWaitCnt(dscnt=0, comment="TDM decoupled: all ds_reads done before %s refill" % singleTc))
     late.add(SBarrier(comment="TDM decoupled: signal+wait done reading %s block" % singleTc))
     lblLate = Label(self.labels.getNameInc("DcpLateFill%sEnd" % singleTc), "")
@@ -3248,14 +3248,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
             tPA = None
           if kernel["DirectToVgprB"]:
             tPB = None
-        # Decouple PGR keeps the legacy prologue here on purpose: both tensors
-        # take this round and both advance. A single-buffered tensor is made
-        # legal by where its fill sits inside the loop body
-        # (_dcpScheduleSingleBufferedFillLate), not by lagging its pointer, so
-        # round counts and the post-loop pointer stay exactly legacy's and the
-        # tail needs no compensation. An earlier attempt held the exhausted
-        # side's increment here; that leaves the tensor one tile behind from the
-        # second unrolled iteration onwards and is why it is gone.
+        # Decoupled PGR advances both tensors here, like legacy. A
+        # single-buffered tensor is made legal by where its fill sits in the
+        # loop body (_dcpScheduleSingleBufferedFillLate), not by lagging its
+        # pointer: holding one side's increment here puts that tensor a tile
+        # behind from the second unrolled iteration onwards.
         module.add(self.globalReadIncrementAB(kernel, tPA, tPB, self.states.unrollIdx, pfi))
         # swap Tensor memToken
         self.states.ldsTensorTokenIdx = \
@@ -7429,10 +7426,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # use inc to switch Lds Buffers (instead of using xor)
     self.states.IncLdsBufSwitch = kernel["NumLdsBlk"] >= 3
     # oneBufferScheduling
-    # DirectToLds already earns one-buffer scheduling by holding exactly as many
-    # LDS blocks as the prefetch depth -- no VGPR staging buffer, so the counts
-    # line up. Decoupled PGR reaches the same shape under TDM, which that
-    # condition never covered.
     self.states.oneBufferScheduling = (kernel["1LDSBuffer"]) or \
                                       decoupledOneBlockBoth(kernel) or \
                                       ((kernel["DirectToLdsA"] or kernel["DirectToLdsB"]) and \
@@ -7449,14 +7442,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # set memory token by LDS buffer setting
     self.states.memTokenLdsBufferMeta = 4
     # A single-buffered tensor reads and refills the same bytes, so the two
-    # buffer tokens must collapse to one or the dependency tracker sees the
+    # buffer tokens have to collapse to one or the dependency tracker sees the
     # refill land on a buffer nothing read and postMainLoopBarrierCheckAndReset
-    # emits no barrier for a real write-after-read. This is the same collapse
-    # 1LDSBuffer already relies on -- the difference is that under decoupled
-    # PGR only one of the two tensors may be single-buffered, and the wave-
-    # separated tensor_load_to_lds is shared between them, so one token has to
-    # cover both. Collapsing is the conservative direction: it can only add
-    # barriers, never remove one that was required.
+    # emits no barrier for a real write-after-read. Under decoupled PGR only
+    # one tensor may be single-buffered, but the wave-separated
+    # tensor_load_to_lds is shared, so the one token has to cover both.
+    # Collapsing can only add barriers, never remove a required one.
     if kernel["1LDSBuffer"] or decoupledSingleBuffered(kernel) or decoupledOneBlockBoth(kernel):
       self.states.memTokenLdsBuffer0 = 0
       self.states.memTokenLdsBuffer1 = 0

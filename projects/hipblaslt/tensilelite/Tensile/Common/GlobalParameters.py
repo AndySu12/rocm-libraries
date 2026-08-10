@@ -480,11 +480,10 @@ defaultBenchmarkCommonParameters = [
     {"WaveSeparateGlobalReadMetadata": [0]},
     {"UnrollLoopSwapGlobalReadOrder": [0]},
     {"PrefetchGlobalRead": [1]},
-    # PrefetchGlobalReadA/B deliberately have no entry here. Absence of the key
-    # in a solution is the "not specified, use the scalar PrefetchGlobalRead"
-    # sentinel, so 0 stays available as a real level. Giving them a default here
-    # would put the key on every solution ever built, changing every solution's
-    # key set, every serialized DefaultSolution and every kernel name.
+    # PrefetchGlobalReadA/B have no entry here on purpose: an absent key is the
+    # "not specified" sentinel, which leaves 0 free to be a real block count. A
+    # default here would put both keys on every solution ever built and rename
+    # every kernel.
     {"PrefetchLocalRead": [1]},
     {"PrefetchGL2": [0]},
     {"ClusterLocalRead": [1]},
