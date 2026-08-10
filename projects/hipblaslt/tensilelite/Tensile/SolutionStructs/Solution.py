@@ -4996,6 +4996,36 @@ class Solution(collections.abc.Mapping):
                "rather than pinning it -- a one-block pair does not need it. Tracking: AIHPBLAS-4159."
                % (pgrA, pgrB, numLdsBlkA, numLdsBlkB))
         return
+      if decoupledOneBlockBoth(state) and not (state["enableTDMA"] and state["enableTDMB"]):
+        # Keyed on the predicate that selects the one-block emit shape, not on
+        # divergence. The TDM requirement used to sit inside the divergent
+        # branch below, so an equal pair reached the same layout without ever
+        # being examined: (1,1) on buffer_load built at 70144 bytes where legacy
+        # gives 201216, and was not the supported one-block kernel either.
+        # Divergence was a proxy for the thing that decides, the block count.
+        #
+        # Level 1 is the whole of the TDM dependence. A block count means a
+        # prefetch depth only where there is no VGPR staging buffer; off TDM
+        # there is one, so legacy PrefetchGlobalRead=1 holds two blocks and
+        # 1LDSBuffer stays orthogonal to depth. Levels 0, 2 and above agree with
+        # the legacy derivation off TDM too, measured identical, and are left
+        # alone.
+        #
+        # This is not a claim that (1,1) is correct on TDM. There it is the same
+        # kernel as legacy PrefetchGlobalRead=1 with 1LDSBuffer=1, which
+        # computes wrong results from K = 2*DepthU on an unpatched tree as well.
+        # The guard stops an undesigned kernel being emitted; it does not make
+        # the supported spelling good.
+        reject(state, printRejectionReason,
+               "PrefetchGlobalReadA/B: PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u "
+               "put both tensors on a single LDS block, and that layout is implemented for "
+               "the TDM path only (TDMInst == 3 on both tensors). The per-tensor value is a "
+               "block count, and a block count means a prefetch depth only where there is no "
+               "VGPR staging buffer. The buffer_load path allocates one, so it holds two LDS "
+               "blocks at this depth and 1LDSBuffer stays independent of PrefetchGlobalRead "
+               "there, which no single block count expresses. Tracking: AIHPBLAS-4159."
+               % (pgrA, pgrB))
+        return
       if numLdsBlkA != numLdsBlkB:
         # A single-buffered tensor is legal only because
         # KernelWriter._dcpScheduleSingleBufferedFillLate can move its fill to a
