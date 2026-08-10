@@ -5007,9 +5007,10 @@ class Solution(collections.abc.Mapping):
         # Level 1 is the whole of the TDM dependence. A block count means a
         # prefetch depth only where there is no VGPR staging buffer; off TDM
         # there is one, so legacy PrefetchGlobalRead=1 holds two blocks and
-        # 1LDSBuffer stays orthogonal to depth. Levels 0, 2 and above agree with
-        # the legacy derivation off TDM too, measured identical, and are left
-        # alone.
+        # 1LDSBuffer stays orthogonal to depth. Levels 0 and 2 were measured
+        # identical to the legacy derivation off TDM -- (0,0) and (2,2) build the
+        # same kernel there as PrefetchGlobalRead=0 and =2 -- and level 3 up maps
+        # to k blocks under both readings, so none of them need this requirement.
         #
         # This is not a claim that (1,1) is correct on TDM. There it is the same
         # kernel as legacy PrefetchGlobalRead=1 with 1LDSBuffer=1, which
