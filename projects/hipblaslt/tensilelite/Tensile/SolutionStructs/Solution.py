@@ -1667,6 +1667,46 @@ class Solution(collections.abc.Mapping):
     state["CUOccupancy"]            = -1
     state["MathClocksUnrolledLoop"] = 0
 
+    # Per-tensor PrefetchGlobalRead: freeze the pair, then derive the scalar
+    # from it. Both belong here, ahead of assignProblemIndependentDerivedParameters
+    # and the twenty-odd later rules that branch on PrefetchGlobalRead, so that all
+    # of derivation sees one value. A scalar rewritten further down would leave the
+    # rules that already read it disagreeing with the loop that gets emitted.
+    #
+    # Deriving beats rejecting a mismatch because the pin is a determined function
+    # of the pair: for any (A, B) exactly one scalar is valid, so a hand-computed
+    # value can only match it or provoke a reject -- it can never select a
+    # different, equally valid kernel. That is what separates this from silently
+    # rewriting a parameter the user is genuinely free to choose.
+    #
+    # Freezing the pair first is not optional. pgrLevelsForTensors falls back to the
+    # scalar for a tensor whose key is absent, so when only one key is given the
+    # scalar is also the other tensor's level. Rewriting it in place would move the
+    # pair with it, and PrefetchGlobalReadA=1 with PrefetchGlobalRead=2 would
+    # quietly become (1,1) -- a different kernel, and the one that computes wrong
+    # answers -- rather than the (1,2) that was asked for.
+    dcpSetPerTensor, dcpPgrA, dcpPgrB = pgrLevelsForTensors(state)
+    if dcpSetPerTensor:
+      state["PrefetchGlobalReadA"] = dcpPgrA
+      state["PrefetchGlobalReadB"] = dcpPgrB
+      dcpPinned = min(max(dcpPgrA, dcpPgrB),
+                      min(ldsBlocksForPgrLevel(dcpPgrA), ldsBlocksForPgrLevel(dcpPgrB)))
+      if state["PrefetchGlobalRead"] != dcpPinned:
+        # Names both numbers and the pair that chose between them: Tensile's build
+        # output is long enough that a warning which does not say what it replaced
+        # is a silent override with extra steps. The value replaced is whatever the
+        # solution carried, which is the default when PrefetchGlobalRead was left
+        # out entirely -- there is no record here of which it was.
+        printWarning(
+          "PrefetchGlobalReadA/B: PrefetchGlobalRead has been set to %u by the decoupled "
+          "rule; the %u this solution carried was not used. PrefetchGlobalReadA=%u and "
+          "PrefetchGlobalReadB=%u determine the scalar, so %u is the only value it can "
+          "take and it does not have to be supplied. The kernel name is built from "
+          "PrefetchGlobalRead, so it will name %u and not %u. Tracking: AIHPBLAS-4159."
+          % (dcpPinned, state["PrefetchGlobalRead"], dcpPgrA, dcpPgrB, dcpPinned,
+             dcpPinned, state["PrefetchGlobalRead"]))
+      state["PrefetchGlobalRead"] = dcpPinned
+
     Solution.assignProblemIndependentDerivedParameters(state, printRejectionReason, isaInfoMap)
 
     if "AssignedDerivedParameters" in state:
@@ -4940,8 +4980,11 @@ class Solution(collections.abc.Mapping):
     dcpDivergent = decouplePGR and numLdsBlkA != numLdsBlkB
     if decouplePGR:
       # Resolve both keys even if only one was given, so a decoupled solution
-      # round-trips through library logic and names both tokens. Legacy
-      # solutions never reach here and so never gain the keys.
+      # round-trips through library logic and names both tokens. Legacy solutions
+      # never reach here and so never gain the keys. assignDerivedParameters has
+      # already written the same two values -- it has to, before it derives the
+      # scalar off them -- so this repeats rather than decides; it stays because
+      # it is what makes the resolution local to the block that reads it.
       state["PrefetchGlobalReadA"] = pgrA
       state["PrefetchGlobalReadB"] = pgrB
       if not tdmBothTensors(state):
@@ -4962,28 +5005,25 @@ class Solution(collections.abc.Mapping):
                "there, which no single block count expresses. Tracking: AIHPBLAS-4159."
                % (pgrA, pgrB, state["TDMInst"]))
         return
-      # The unrolled loop skeleton is still emitted from the scalar, so the
-      # pair has to pin it to one value. The bound is a depth bound, not
-      # equality with the deepest level: the prologue issues PrefetchGlobalRead
-      # fill rounds back to back with no consumer between them, so a tensor
-      # holding N blocks can retire at most N rounds before round N+1
-      # overwrites a tile the no-load loops still have to read. The shallowest
-      # tensor therefore caps the skeleton, and max(pgrA, pgrB) survives only as
-      # the other cap. Rejecting rather than rewriting keeps the solution the
-      # user wrote and the solution that gets built the same thing.
+      # The unrolled loop skeleton is still emitted from the scalar, and the pair
+      # pins it: never deeper than the deepest level asked for, and never deeper
+      # than the number of LDS blocks the shallowest tensor holds, because the
+      # prologue issues one fill round per level with nothing consuming between
+      # them. assignDerivedParameters set the scalar to exactly this before any
+      # rule read it, so reaching here with a different value is not a user error
+      # -- it means a later rule moved the scalar out from under the pin, which
+      # DirectToVgprA + DirectToVgprB is the one rule that does. Emitting a
+      # skeleton the block counts cannot feed is precisely the silent wrong answer
+      # this feature already carries one of, so refuse instead.
       pgrSkeleton = min(max(pgrA, pgrB), min(numLdsBlkA, numLdsBlkB))
       if state["PrefetchGlobalRead"] != pgrSkeleton:
         reject(state, printRejectionReason,
-               "PrefetchGlobalReadA/B: PrefetchGlobalRead=%u must equal %u for "
-               "PrefetchGlobalReadA=%u (%u LDS block(s)) and PrefetchGlobalReadB=%u "
-               "(%u LDS block(s)). The unrolled loop is emitted from the scalar level, "
-               "so the pair pins it to one value: never deeper than the deepest level "
-               "asked for (%u), and never deeper than the number of LDS blocks the "
-               "shallowest tensor holds (%u), because the prologue issues one fill "
-               "round per level with nothing consuming between them. "
-               "Tracking: AIHPBLAS-4159."
+               "PrefetchGlobalReadA/B: PrefetchGlobalRead=%u no longer matches the %u "
+               "pinned by PrefetchGlobalReadA=%u (%u LDS block(s)) and "
+               "PrefetchGlobalReadB=%u (%u LDS block(s)); a later rule moved the scalar "
+               "after it was derived. Tracking: AIHPBLAS-4159."
                % (state["PrefetchGlobalRead"], pgrSkeleton, pgrA, numLdsBlkA,
-                  pgrB, numLdsBlkB, max(pgrA, pgrB), min(numLdsBlkA, numLdsBlkB)))
+                  pgrB, numLdsBlkB))
         return
       if pgrA != pgrB and numLdsBlkA == numLdsBlkB:
         printWarning(
