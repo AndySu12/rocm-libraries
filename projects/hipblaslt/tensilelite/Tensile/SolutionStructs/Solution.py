@@ -5076,6 +5076,32 @@ class Solution(collections.abc.Mapping):
                  "into, and this solution has none: %s. Tracking: AIHPBLAS-4159."
                  % (numLdsBlkA, numLdsBlkB, dcpUnsupported))
           return
+      # TODO(AIHPBLAS-4159): both tensors on a single LDS block builds and fits,
+      # then computes wrong results from K = 2*DepthU -- 12 of 24 rows wrong on an
+      # FFM sweep, the boundary exactly between K=992 and K=1024 at DepthU 512.
+      # Left unfixed on purpose. The defect is in the legacy one-block path as
+      # much as in this one: PrefetchGlobalRead=1 with 1LDSBuffer=1 selects the
+      # same emit and fails identically on a tree without this feature, so
+      # whoever fixes it has to fix PrefetchGlobalRead, PrefetchGlobalReadA and
+      # PrefetchGlobalReadB together. Fixing only the decoupled half would look
+      # right and quietly leave the legacy spelling broken.
+      #
+      # The mechanism that makes the divergent case correct does not carry over.
+      # There, KernelWriter._dcpScheduleSingleBufferedFillLate relocates the
+      # single-buffered tensor's fill into the slot after that tensor's last read
+      # of the block, and that slot exists only because the other tensor is
+      # double-buffered and keeps the pipeline fed meanwhile. With both tensors on
+      # one block there is no partner to supply it and so no such slot. A
+      # different mechanism is needed and none has been designed.
+      if decoupledOneBlockBoth(state):
+        printWarning(
+          "PrefetchGlobalReadA/B: PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u put "
+          "both tensors on a single LDS block. This builds and fits, but computes wrong "
+          "results from K = 2*DepthU. It is not particular to the per-tensor spelling: "
+          "legacy PrefetchGlobalRead=1 with 1LDSBuffer=1 selects the same one-block path "
+          "and fails the same way without this feature, so it is left as it is rather "
+          "than half-fixed. Tracking: AIHPBLAS-4159."
+          % (pgrA, pgrB))
 
     # check for auto DtlPlusLdsBuf
     if state["DtlPlusLdsBuf"] == -1:
