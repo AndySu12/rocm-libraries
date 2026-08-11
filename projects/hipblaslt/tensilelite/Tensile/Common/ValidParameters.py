@@ -352,6 +352,10 @@ validParameters = { # we need to make sure this matches develop
     # block, 2 gives two. Common.DecouplePgr.ldsBlocksForPgrLevel is the map and
     # the only place that reads these. Absent means "not specified, use the
     # scalar", so 0 is a real value and not an off switch.
+    # Setting either key requires the TDM on both tensors (TDMInst == 3). A block
+    # count is a prefetch depth only where nothing stages the tile in VGPRs
+    # first, so off that path the value has no defined meaning and is rejected --
+    # including the levels that happen to agree with the scalar derivation there.
     "PrefetchGlobalReadA": [0, 1, 2] + list(range(3,16 + 1)),
     "PrefetchGlobalReadB": [0, 1, 2] + list(range(3,16 + 1)),
     # number of iteration prefetch local reads from lds to VGPRs buffer = PLR
