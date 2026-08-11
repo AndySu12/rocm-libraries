@@ -356,6 +356,9 @@ validParameters = { # we need to make sure this matches develop
     # count is a prefetch depth only where nothing stages the tile in VGPRs
     # first, so off that path the value has no defined meaning and is rejected --
     # including the levels that happen to agree with the scalar derivation there.
+    # Setting either key also DERIVES PrefetchGlobalRead from the pair and
+    # ignores whatever scalar was written: the pin leaves exactly one valid
+    # scalar, so it is computed rather than demanded. A warning names both.
     "PrefetchGlobalReadA": [0, 1, 2] + list(range(3,16 + 1)),
     "PrefetchGlobalReadB": [0, 1, 2] + list(range(3,16 + 1)),
     # number of iteration prefetch local reads from lds to VGPRs buffer = PLR
