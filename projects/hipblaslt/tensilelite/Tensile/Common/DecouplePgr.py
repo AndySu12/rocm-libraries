@@ -104,6 +104,39 @@ def decoupledSingleBuffered(ks):
     return decoupled and min(numLdsBlkA, numLdsBlkB) == 1 and max(numLdsBlkA, numLdsBlkB) > 1
 
 
+def tdmDealiasAB(ks):
+    """True when A and B get their own TDM descriptor sets instead of sharing one.
+
+    The multi-wave TDM aliases B's descriptor onto A's and lets wave parity
+    decide which tensor the single ``tensor_load_to_lds`` resolves to. That makes
+    the fill one instruction serving two tensors, so it can sit at only one slot
+    in the loop body and a per-tensor cadence has to reach it by emitting the
+    same module twice under complementary parity guards.
+
+    Divergent block counts are the shapes that want two cadences, so they are the
+    shapes that pay the 12 SGPRs (Group0 is 4, Group1 is 8, both fixed tuple
+    widths of tensor_load_to_lds). Equal counts keep the alias: they are
+    byte-identical to a legacy configuration today and that identity is the
+    evidence the feature rests on.
+
+    MXSA/MXSB stay parity-aliased regardless -- de-aliasing all four is another
+    24 SGPRs and the scale tensors have no independent cadence to express.
+
+    TDMSplit keeps the alias. Its multi-wave increment recomputes one
+    parity-selected split stride and applies it to the one shared descriptor
+    (_tdmSplitMultiWaveInc); two descriptors would need two, and that
+    combination is not exercised here.
+    """
+    decoupled, numLdsBlkA, numLdsBlkB = decouplePgrBlocks(ks)
+    if not (decoupled and numLdsBlkA != numLdsBlkB):
+        return False
+    if not tdmBothTensors(ks):
+        return False
+    if ks.get("TDMSplit"):
+        return False
+    return ks.get("NumWaves", 1) > 1 and not ks.get("UseSubtileImpl")
+
+
 def decoupledOneBlockBoth(ks):
     """True when both tensors are on a single LDS block inside a prefetch loop.
 

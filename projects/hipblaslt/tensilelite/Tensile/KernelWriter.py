@@ -50,7 +50,8 @@ from .Components.Signature import UserArgumentsInfo
 from .Components.CustomSchedule import customMainLoopSchedule
 from .Components.StreamK import streamKVariantClass
 from .Components.Subtile.Kernel import *
-from .Common.DecouplePgr import decouplePgrBlocks, decoupledSingleBuffered, decoupledOneBlockBoth
+from .Common.DecouplePgr import decouplePgrBlocks, decoupledSingleBuffered, decoupledOneBlockBoth, \
+                                tdmDealiasAB
 from .SolutionStructs import Solution, isPackedIndex
 from .SolutionStructs.Utilities import getMiInputType
 from .AsmMemoryInstruction import MemoryInstruction
@@ -771,6 +772,64 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # closed by the sync already at the head of this sub-iteration.
     late.add(SWaitCnt(dscnt=0, comment="TDM decoupled: all ds_reads done before %s refill" % singleTc))
     late.add(SBarrier(comment="TDM decoupled: signal+wait done reading %s block" % singleTc))
+
+    if self.tdmDealiasAB(kernel):
+      # A and B hold their own descriptors, so each fill is one instruction
+      # already guarded to the waves that carry that tensor. That is what makes
+      # the re-slot a move rather than a duplication: the single-buffered
+      # tensor's fill goes to the late slot on its own, the other stays at the
+      # top, and neither needs a guard added because the guard it carries is the
+      # one that selects it.
+      #
+      # Everything else in the group still has to appear at both slots under
+      # complementary guards, and it is a correctness requirement, not tidiness:
+      #
+      #   - the MX scale pair is still parity-aliased, so its fill is still one
+      #     instruction serving both scales. MXSA follows A's block count and
+      #     MXSB follows B's, so the copy that runs late is the one on the
+      #     single-buffered parity.
+      #   - the descriptor advances must stay with the fill they follow. A wave
+      #     fills from the pointer it holds and then advances it; leaving the
+      #     advance at the top while the fill moves late would have the late fill
+      #     read from an address already moved on one iteration. Measured: doing
+      #     that fails FFM validation for every K > DepthU (first failure
+      #     512x512x1x544) while K <= DepthU still passes, because the body has
+      #     to execute for the ordering to matter.
+      singleFill = self.codes.globalReadA if singleIsA else self.codes.globalReadB
+      doubleFill = self.codes.globalReadB if singleIsA else self.codes.globalReadA
+      rest = Module("TDM decoupled per-parity fill group")
+      kept = []
+      for item in src.items():
+        if item is doubleFill:
+          kept.append(item)          # stays at the top, on its own guard
+        elif item is singleFill:
+          continue                   # moves to the late slot, on its own guard
+        else:
+          rest.add(item)
+      hasRest = rest.itemsSize() > 0
+
+      if hasRest:
+        lblEarly = Label(self.labels.getNameInc("DcpEarlyFill%sEnd" % doubleTc), "")
+        early = Module("TDM decoupled early fill group %s" % doubleTc)
+        parityCheck(early)
+        early.add(skipEarly(labelName=lblEarly.getLabelName(),
+                            comment="this wave carries %s, whose group moves late" % singleTc))
+        early.add(rest)
+        early.add(lblEarly)
+        kept.append(early)
+      src.setItems(kept)
+
+      late.add(singleFill)
+      if hasRest:
+        lblLate = Label(self.labels.getNameInc("DcpLateFill%sEnd" % singleTc), "")
+        parityCheck(late)
+        late.add(skipLate(labelName=lblLate.getLabelName(),
+                          comment="this wave carries %s, whose group stays at the top" % doubleTc))
+        late.add(deepcopy(rest))
+        late.add(lblLate)
+      self.codes.perIterGlobalRead[lateIter].add(late)
+      return
+
     lblLate = Label(self.labels.getNameInc("DcpLateFill%sEnd" % singleTc), "")
     parityCheck(late)
     late.add(skipLate(labelName=lblLate.getLabelName(),
@@ -3101,10 +3160,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
           module.add(self.releaseGlobalReadIncsSgprsAfterTdmWaveSep(kernel))
 
       # WaveIdx already freed for subtile (before graWorkGroup above)
-      # TDM StaggerU also reads wave parity from WaveIdx
+      # TDM StaggerU also reads wave parity from WaveIdx, and so does a
+      # de-aliased A/B pair, whose two fills are each parity-guarded.
       if (kernel["enableTDMA"] or kernel["enableTDMB"]) and not kernel["ClusterBarrier"] \
           and not kernel.get("UseSubtileImpl") \
-          and not (self.states.staggerUCode and self.isTdmWaveSeparated(kernel)):
+          and not (self.states.staggerUCode and self.isTdmWaveSeparated(kernel)) \
+          and not tdmDealiasAB(kernel):
         module.add(self.undefineSgpr("WaveIdx"))
 
       ###########################################################################
@@ -4002,7 +4063,9 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 pointerLWCode.add(self.localWriteSwapOffsets(kernel, expand, tensorParametersB["MX"]))
             if kernel["enableTDMB"]:
               #TODO: TDM refactor
-              if kernel["NumWaves"] == 1:
+              # B owns an LDS address of its own whenever its descriptor is its
+              # own, so it needs its own swap in exactly those cases.
+              if kernel["NumWaves"] == 1 or self.tdmDealiasAB(kernel):
                 pointerLWCode.addComment1("tdm swap offsets b")
                 pointerLWCode.add(self.tdmSwapLdsOffset(kernel, tensorParametersB))
             elif not kernel["NoLdsWriteCode"]:
@@ -4891,7 +4954,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
               pointerLWCode.add(self.localWriteSwapOffsets(kernel, expand, tensorParametersB["MX"]))
           if kernel["enableTDMB"]:
             #TODO: TDM refactor
-            if kernel["NumWaves"] == 1:
+            if kernel["NumWaves"] == 1 or self.tdmDealiasAB(kernel):
               pointerLWCode.addComment1("tdm swap offsets b")
               pointerLWCode.add(self.tdmSwapLdsOffset(kernel, tensorParametersB))
           else:
@@ -5632,7 +5695,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       if kernel["enableTDMB"]:
         #TODO: TDM refactor
-        if kernel["NumWaves"] == 1:
+        if kernel["NumWaves"] == 1 or self.tdmDealiasAB(kernel):
           module.addComment1("TDM swap lds b")
           module.add(self.tdmSwapLdsOffset(kernel, tensorParametersB))
       else:
@@ -7132,8 +7195,43 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # - workgroup cluster: staggerU offsets each WG's K start so WGs sharing the
     #   same B never request the same address at the same time, which defeats
     #   cross-WG multicast. Disable stagger so K phases stay aligned.
+    # - de-aliased TDM descriptors with stagger unreachable: a nonzero StaggerU
+    #   can only arrive baked in at compile time (kernel["StaggerU"]) or at run
+    #   time through the kernel argument that
+    #   InternalSupportParams.SupportCustomStaggerU advertises. With neither
+    #   route the offset is always zero, yet StaggerUIter and the four WrapU
+    #   pairs stay allocated across the whole main loop; on the hero shape that
+    #   is the 12 SGPRs the second descriptor set needs to fit under 106.
+    #   Solution._disableUnsupportedRuntimeStaggerU closes the runtime route for
+    #   exactly this family, and removeGROffsetsVariableSgprsFromPool already
+    #   tests the same predicate as needsStaggerSgprs.
+    #
+    #   Deliberately narrowed to the de-aliased family rather than applied to
+    #   every solution whose stagger is unreachable. The wider gate also reaches
+    #   PAP+TDMInst==3 and PrefetchGL2>0, and there StreamK's constant-increment
+    #   substitution (useConstSgprGlobalReadIncs, taken only when staggerUCode is
+    #   false) turns GlobalReadIncs* into assembler constants while the
+    #   wave-separated TDM setup still names them as SGPRs. Measured on
+    #   Tests/common/streamk/gfx1250/core/sk_mxf4gemm_pap_prefetchgl2.yaml: the
+    #   wider gate makes every kernel there fail to assemble with
+    #   "expected absolute expression". That is a pre-existing incompatibility
+    #   between two features this change does not own, so this does not reach it.
+    #
+    #   CustomMainLoopSchedule is excluded because its main loop is emitted from
+    #   a fixed positional table (Components/CustomSchedule.py) whose
+    #   GRIncA/GRIncB slot lists are all authored at the stagger-enabled length
+    #   of nine, and scheduleInst indexes the emitted instructions by slot
+    #   position. Dropping the wrap leaves a six-instruction increment the table
+    #   cannot address. CMS is gfx950-only and the TDM is not, so the two cannot
+    #   meet today; the clause is here so that stays true if either moves.
+    staggerUUnreachable = \
+        not (kernel["StaggerU"] > 0 or
+             kernel["InternalSupportParams"]["SupportCustomStaggerU"]) and \
+        not kernel["UseCustomMainLoopSchedule"] and \
+        tdmDealiasAB(kernel)
     self.states.staggerUCode = True
-    if self.states.tailloopInNll or \
+    if staggerUUnreachable or \
+       self.states.tailloopInNll or \
        not kernel["BufferLoad"] or \
        (kernel["StreamK"] and \
         hasMx and isgfx950) or \

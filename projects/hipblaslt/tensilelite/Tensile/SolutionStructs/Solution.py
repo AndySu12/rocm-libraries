@@ -39,7 +39,8 @@ from Tensile.Common import assignParameterWithDefault, IsaInfo, \
                     roundUpToNearestMultiple, effectiveMatrixInstMN
 from Tensile.Common.DataType import DataType
 from Tensile.Common.DecouplePgr import pgrLevelsForTensors, ldsBlocksForPgrLevel, \
-                                       decoupledOneBlockBoth, tdmBothTensors
+                                       decoupledOneBlockBoth, tdmBothTensors, \
+                                       tdmDealiasAB
 from Tensile.Common.TypeValidationErrors import ConfigTypeError
 from Tensile.SolutionStructs.LdsPadding import get_fp4_mt_config, get_fp8_mt_config, get_mxs_mt_config, \
                                                get_fp16_mt_config, get_fp32_mt_config
@@ -187,6 +188,17 @@ def _disableUnsupportedRuntimeStaggerU(state):
   # Workgroup cluster: staggerU breaks cross-WG multicast, so force the runtime
   # StaggerU path off too (KernelWriter already gates staggerUCode off for clusters).
   if state.get("ClusterDim", [1, 1]) != [1, 1]:
+    _disableRuntimeStaggerU(state)
+  # A divergent decoupled-PGR pair on the multi-wave TDM gives A and B their own
+  # descriptor sets so their fills can sit at different slots. Two descriptors
+  # cost 12 SGPRs against an architectural ceiling of 106 addressable scalars
+  # (s0..s105; MaxSgpr is 106 for ISA 12.5 and exceeding it drops the solution),
+  # and the hero shape has 6 to spare only once StaggerUIter and the four WrapU
+  # pairs go. Runtime StaggerU is what holds them: with StaggerU already 0 at
+  # compile time, SupportCustomStaggerU is the only remaining route to a nonzero
+  # value. This buys the registers by declaring that route closed, which is the
+  # same trade PAP+TDMInst==3 above already makes.
+  if tdmDealiasAB(state):
     _disableRuntimeStaggerU(state)
 
 
