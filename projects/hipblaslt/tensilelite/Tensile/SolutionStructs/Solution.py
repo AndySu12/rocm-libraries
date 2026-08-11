@@ -1686,6 +1686,39 @@ class Solution(collections.abc.Mapping):
     # quietly become (1,1) -- a different kernel, and the one that computes wrong
     # answers -- rather than the (1,2) that was asked for.
     dcpSetPerTensor, dcpPgrA, dcpPgrB = pgrLevelsForTensors(state)
+    # An equal pair is a legacy solution in per-tensor spelling: one block count
+    # for both tensors is the legacy PrefetchGlobalRead=k layout, loop and kernel.
+    # So resolve it away here rather than handle it downstream. Everything past
+    # this point then sees an ordinary scalar solution, and none of the A/B
+    # asynchrony machinery has to be correct for a case that never uses it.
+    # Measured: (0,0) and (2,2) emit byte-identically to legacy 0 and 2, kernel
+    # name included, which is what makes this a resolution and not a rewrite.
+    #
+    # (1,1) is excluded and stays on the decoupled path. Its only byte-identical
+    # legacy spelling is PrefetchGlobalRead=1 with 1LDSBuffer=1 -- plain legacy 1
+    # under the TDM holds two LDS blocks, 219392 bytes against (1,1)'s 88320,
+    # because the block-count derivation never consults the load mechanism. So
+    # degenerating it would mean setting 1LDSBuffer implicitly, which this path is
+    # required to stay clear of, and would give up ScheduleIterAlg 0, where
+    # 1LDSBuffer=1 is rejected.
+    if dcpSetPerTensor and dcpPgrA == dcpPgrB and dcpPgrA != 1:
+      printWarning(
+        "PrefetchGlobalReadA/B: PrefetchGlobalReadA and PrefetchGlobalReadB are both "
+        "%u, which is legacy PrefetchGlobalRead=%u exactly -- the same block count on "
+        "both tensors, the same LDS layout and the same loop. Both keys have been "
+        "dropped and this is built as an ordinary PrefetchGlobalRead=%u solution%s. It "
+        "will therefore name PGRA0_PGRB0 like any other legacy kernel rather than "
+        "PGRA%u_PGRB%u. The per-tensor path is for divergent pairs; an equal pair has "
+        "nothing for it to do. Tracking: AIHPBLAS-4159."
+        % (dcpPgrA, dcpPgrA, dcpPgrA,
+           "" if state["PrefetchGlobalRead"] == dcpPgrA else
+           " (the PrefetchGlobalRead=%u it carried is not used)" % state["PrefetchGlobalRead"],
+           dcpPgrA, dcpPgrA))
+      for dcpKey in ("PrefetchGlobalReadA", "PrefetchGlobalReadB"):
+        if dcpKey in state:
+          del state[dcpKey]
+      state["PrefetchGlobalRead"] = dcpPgrA
+      dcpSetPerTensor = False
     if dcpSetPerTensor:
       state["PrefetchGlobalReadA"] = dcpPgrA
       state["PrefetchGlobalReadB"] = dcpPgrB
