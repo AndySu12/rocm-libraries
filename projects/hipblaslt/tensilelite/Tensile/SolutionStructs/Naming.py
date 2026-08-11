@@ -108,6 +108,25 @@ def getKeyNoInternalArgs(state, splitGSU: bool) -> str:
   return key + cof + dn
 
 
+# PrefetchGlobalReadA/B are named on every kernel, including the legacy
+# solutions that never carry the keys at all. Naming them only when present made
+# the tokens report which spelling a solution was written in rather than what
+# the kernel is, and the conditional cost more machinery than the distinction
+# was worth.
+#
+# An absent key names 0, not the scalar it resolves to during derivation. 0
+# doubles as "not asked for" here, which costs a reader nothing -- a legacy
+# kernel already names its prefetch depth in PGR -- and buys the property that
+# matters: no legacy kernel can take a decoupled kernel's name. Naming the
+# scalar was measured to do exactly that. Legacy PrefetchGlobalRead=1 with
+# 1LDSBuffer=0 holds two LDS blocks and decoupled (1,1) holds one, no other
+# named parameter separates them, and naming both PGRA1_PGRB1 gives two
+# different kernels one name. It is also the spelling every comparator built
+# around this feature already assumes -- see impl_v2/cmp_syms2.py.
+_perTensorPgrKeys = frozenset(("PrefetchGlobalReadA", "PrefetchGlobalReadB"))
+_perTensorPgrAbsentLevel = 0
+
+
 @lru_cache(maxsize=None)
 def getParameterNameAbbreviation( name: str ):
   return ''.join(c for c in name if c.isupper())
@@ -226,9 +245,15 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
     requiredParametersTemp.add("LDSSegmentInterleave")
 
   for key in sorted(requiredParametersTemp):
-    if key not in state or key == "CustomKernelName":
+    if key not in state:
+      if key not in _perTensorPgrKeys:
+        continue
+      value = _perTensorPgrAbsentLevel
+    elif key == "CustomKernelName":
       continue
-    components.append(f'{getParameterNameAbbreviation(key)}{getParameterValueAbbreviation(key, state[key])}')
+    else:
+      value = state[key]
+    components.append(f'{getParameterNameAbbreviation(key)}{getParameterValueAbbreviation(key, value)}')
 
   state["GlobalSplitU"] = gsuBackup
   state["ProblemType"]["GroupedGemm"] = ggBackup
