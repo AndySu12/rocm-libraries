@@ -63,6 +63,24 @@ def ldsBlocksForPgrLevel(pgr):
     return 2 if pgr == 2 else pgr
 
 
+def tdmBothTensors(ks):
+    """True when the TDM moves both tensors, which the per-tensor levels need.
+
+    TDMInst is a per-tensor bitmask, bit 0 for A and bit 1 for B, read here
+    rather than compared against 3 so this does not depend on the separate
+    reject that pins the parameter to 0 or 3.
+
+    This is the precondition for the whole feature, not for one shape of it. A
+    per-tensor value is a block count, and a block count is a prefetch depth
+    only where nothing stages the tile in VGPRs first. The TDM stages nothing,
+    so the two readings coincide there and the parameter has a meaning; on
+    buffer_load they do not, and levels that happen to agree with the legacy
+    derivation agree by coincidence.
+    """
+    tdmInst = ks.get("TDMInst", 0)
+    return bool(tdmInst & 0x01) and bool(tdmInst & 0x02)
+
+
 def decouplePgrBlocks(ks):
     """(decoupled, numLdsBlkA, numLdsBlkB).
 

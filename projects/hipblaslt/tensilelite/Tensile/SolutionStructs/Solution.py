@@ -39,7 +39,7 @@ from Tensile.Common import assignParameterWithDefault, IsaInfo, \
                     roundUpToNearestMultiple, effectiveMatrixInstMN
 from Tensile.Common.DataType import DataType
 from Tensile.Common.DecouplePgr import pgrLevelsForTensors, ldsBlocksForPgrLevel, \
-                                       decoupledOneBlockBoth
+                                       decoupledOneBlockBoth, tdmBothTensors
 from Tensile.Common.TypeValidationErrors import ConfigTypeError
 from Tensile.SolutionStructs.LdsPadding import get_fp4_mt_config, get_fp8_mt_config, get_mxs_mt_config, \
                                                get_fp16_mt_config, get_fp32_mt_config
@@ -4944,6 +4944,24 @@ class Solution(collections.abc.Mapping):
       # solutions never reach here and so never gain the keys.
       state["PrefetchGlobalReadA"] = pgrA
       state["PrefetchGlobalReadB"] = pgrB
+      if not tdmBothTensors(state):
+        # The whole feature requires the TDM, not just the shapes that
+        # misbuild without it. Off the TDM, (0,0) and (2,2) do measure
+        # byte-identical to legacy PrefetchGlobalRead=0 and =2, but that is
+        # coincidence, not design: legacy PrefetchGlobalRead=2 with
+        # 1LDSBuffer=1 is a third kernel on that path and no single block
+        # count spells it, so the block-count reading is undefined off the
+        # TDM rather than merely awkward at level 1.
+        reject(state, printRejectionReason,
+               "PrefetchGlobalReadA/B: PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u "
+               "require both tensors to move data with the TDM (TDMInst == 3); this "
+               "solution has TDMInst=%u. The per-tensor value is a block count, and a "
+               "block count is a prefetch depth only where there is no VGPR staging "
+               "buffer. The buffer_load path allocates one, so it holds two LDS blocks "
+               "at this depth and 1LDSBuffer stays independent of PrefetchGlobalRead "
+               "there, which no single block count expresses. Tracking: AIHPBLAS-4159."
+               % (pgrA, pgrB, state["TDMInst"]))
+        return
       # The unrolled loop skeleton is still emitted from the scalar, so the
       # pair has to pin it to one value. The bound is a depth bound, not
       # equality with the deepest level: the prologue issues PrefetchGlobalRead
@@ -4996,37 +5014,6 @@ class Solution(collections.abc.Mapping):
                "rather than pinning it -- a one-block pair does not need it. Tracking: AIHPBLAS-4159."
                % (pgrA, pgrB, numLdsBlkA, numLdsBlkB))
         return
-      if decoupledOneBlockBoth(state) and not (state["enableTDMA"] and state["enableTDMB"]):
-        # Keyed on the predicate that selects the one-block emit shape, not on
-        # divergence. The TDM requirement used to sit inside the divergent
-        # branch below, so an equal pair reached the same layout without ever
-        # being examined: (1,1) on buffer_load built at 70144 bytes where legacy
-        # gives 201216, and was not the supported one-block kernel either.
-        # Divergence was a proxy for the thing that decides, the block count.
-        #
-        # Level 1 is the whole of the TDM dependence. A block count means a
-        # prefetch depth only where there is no VGPR staging buffer; off TDM
-        # there is one, so legacy PrefetchGlobalRead=1 holds two blocks and
-        # 1LDSBuffer stays orthogonal to depth. Levels 0 and 2 were measured
-        # identical to the legacy derivation off TDM -- (0,0) and (2,2) build the
-        # same kernel there as PrefetchGlobalRead=0 and =2 -- and level 3 up maps
-        # to k blocks under both readings, so none of them need this requirement.
-        #
-        # This is not a claim that (1,1) is correct on TDM. There it is the same
-        # kernel as legacy PrefetchGlobalRead=1 with 1LDSBuffer=1, which
-        # computes wrong results from K = 2*DepthU on an unpatched tree as well.
-        # The guard stops an undesigned kernel being emitted; it does not make
-        # the supported spelling good.
-        reject(state, printRejectionReason,
-               "PrefetchGlobalReadA/B: PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u "
-               "put both tensors on a single LDS block, and that layout is implemented for "
-               "the TDM path only (TDMInst == 3 on both tensors). The per-tensor value is a "
-               "block count, and a block count means a prefetch depth only where there is no "
-               "VGPR staging buffer. The buffer_load path allocates one, so it holds two LDS "
-               "blocks at this depth and 1LDSBuffer stays independent of PrefetchGlobalRead "
-               "there, which no single block count expresses. Tracking: AIHPBLAS-4159."
-               % (pgrA, pgrB))
-        return
       if numLdsBlkA != numLdsBlkB:
         # A single-buffered tensor is legal only because
         # KernelWriter._dcpScheduleSingleBufferedFillLate can move its fill to a
@@ -5037,8 +5024,6 @@ class Solution(collections.abc.Mapping):
         dcpUnsupported = None
         if max(numLdsBlkA, numLdsBlkB) > 2:
           dcpUnsupported = "more than two LDS blocks for a tensor is not supported"
-        elif not (state["enableTDMA"] and state["enableTDMB"]):
-          dcpUnsupported = "both tensors must move data with the TDM (TDMInst == 3)"
         elif state["ScheduleIterAlg"] != 0:
           dcpUnsupported = "only ScheduleIterAlg=0 places the fill where it can be moved"
         elif state["PrefetchLocalRead"] < 1:
