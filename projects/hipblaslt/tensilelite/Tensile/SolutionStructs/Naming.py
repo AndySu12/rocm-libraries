@@ -108,23 +108,51 @@ def getKeyNoInternalArgs(state, splitGSU: bool) -> str:
   return key + cof + dn
 
 
-# PrefetchGlobalReadA/B are named on every kernel, including the legacy
-# solutions that never carry the keys at all. Naming them only when present made
-# the tokens report which spelling a solution was written in rather than what
-# the kernel is, and the conditional cost more machinery than the distinction
-# was worth.
+# THE SWITCH: does a key the solution does not carry get NAMED?
 #
-# An absent key names 0, not the scalar it resolves to during derivation. 0
-# doubles as "not asked for" here, which costs a reader nothing -- a legacy
-# kernel already names its prefetch depth in PGR -- and buys the property that
-# matters: no legacy kernel can take a decoupled kernel's name. Naming the
-# scalar was measured to do exactly that. Legacy PrefetchGlobalRead=1 with
-# 1LDSBuffer=0 holds two LDS blocks and decoupled (1,1) holds one, no other
-# named parameter separates them, and naming both PGRA1_PGRB1 gives two
-# different kernels one name. It is also the spelling every comparator built
-# around this feature already assumes -- see impl_v2/cmp_syms2.py.
-_perTensorPgrKeys = frozenset(("PrefetchGlobalReadA", "PrefetchGlobalReadB"))
-_perTensorPgrAbsentLevel = 0
+# One place, two reachable behaviours, because this has already been flipped
+# twice -- conditional, unconditional, conditional again -- and the convention
+# owner has not formally answered. The current setting is this codebase's
+# reading of the design principle, not a ruling, so a flip back is live. Flip
+# _NAME_ABSENT_KEYS and regenerate the snapshots; nothing else here has to be
+# worked out again.
+#
+# MEASURED COST OF EACH DIRECTION, so nobody re-derives it:
+#
+#   False -- hidden when off (current)
+#       227 pre-existing golden kernels byte-identical in NAME and in assembly.
+#       Zero characterization snapshots differ from the merge-base for naming.
+#       (One .ambr on this branch does differ, ValidParameters'
+#       test_builders_char, but that records only that PrefetchGlobalReadA/B
+#       exist as parameters, and it differs whichever way this switch is set.)
+#
+#   True -- named on every kernel
+#       227 kernels rename. Zero assembly movement, measured name-neutrally.
+#       51 .ambr files, 77 snapshot entries, 239 changed lines -- of which 222
+#       are hash-shortened filename tails past shortenFileBase's 48-character
+#       pivot (MAX_FILENAME_LENGTH * 3 // 4) and only 17 are readable full
+#       names.
+#
+# WHY FALSE IS THE CURRENT CHOICE. The characterization snapshots exist to
+# catch an UNINTENDED kernel-name change. A parameter that renames every kernel
+# while it is switched off moves 51 of them for a change with no semantic
+# effect, and a 239-line diff that is 93% unreadable hash tails gets
+# regenerated reflexively rather than reviewed -- which is exactly the habit a
+# real rename would slip through. Hidden-when-off is what keeps those files
+# load-bearing. The argument the other way is real but smaller: named
+# unconditionally, PGRA/PGRB report what the kernel IS rather than which
+# spelling its solution happened to be written in.
+#
+# WHAT AN ABSENT KEY NAMES WHEN THE SWITCH IS TRUE. The level below, not the
+# scalar the key resolves to during derivation. Naming the scalar was measured
+# to collide: legacy PrefetchGlobalRead=1 at 1LDSBuffer=0 holds two LDS blocks
+# at 219392 bytes and decoupled (1,1) holds one at 88320, no other named
+# parameter separates them, and naming the scalar gives both PGRA1_PGRB1 -- two
+# different kernels under one name. 0 doubles as "not asked for" in the name
+# only, where it costs a reader nothing, since a legacy kernel already names
+# its prefetch depth in PGR.
+_NAME_ABSENT_KEYS = False
+_ABSENT_KEY_LEVEL = {"PrefetchGlobalReadA": 0, "PrefetchGlobalReadB": 0}
 
 
 @lru_cache(maxsize=None)
@@ -244,15 +272,20 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
   if state.get("LDSSegmentInterleave") == 1:
     requiredParametersTemp.add("LDSSegmentInterleave")
 
+  # The one place that decides whether an absent key is named. Optional
+  # parameters otherwise opt IN above -- LDSSegmentInterleave and
+  # SpaceFillingAlgo both do -- and _NAME_ABSENT_KEYS is the switch for the
+  # keys that have a defined "not specified" level instead. See its comment for
+  # the measured cost of each setting.
   for key in sorted(requiredParametersTemp):
-    if key not in state:
-      if key not in _perTensorPgrKeys:
-        continue
-      value = _perTensorPgrAbsentLevel
-    elif key == "CustomKernelName":
+    if key == "CustomKernelName":
       continue
-    else:
+    if key in state:
       value = state[key]
+    elif _NAME_ABSENT_KEYS and key in _ABSENT_KEY_LEVEL:
+      value = _ABSENT_KEY_LEVEL[key]
+    else:
+      continue
     components.append(f'{getParameterNameAbbreviation(key)}{getParameterValueAbbreviation(key, value)}')
 
   state["GlobalSplitU"] = gsuBackup
