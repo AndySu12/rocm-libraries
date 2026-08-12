@@ -1185,6 +1185,77 @@ validParameters = { # we need to make sure this matches develop
     # are not split regardless of this flag. When True, two extra SGPRs are allocated to
     # hold the per-iteration LDS and global address increments for the split loads.
     "TDMSplit": [False, True],
+    # TDMFuse -- how the TDM's transfers are FUSED: which tensors share one
+    # descriptor register set and therefore ride on a single emitted
+    # tensor_load_to_lds, the wave index selecting which member a given wave
+    # actually moves.
+    #
+    # A fused group is one descriptor set AND one instruction; here those are
+    # the same thing. rocisa::TensorLoadToLds carries exactly one descriptor --
+    # group0 is one LDS address plus one 64-bit global address, group1 one set
+    # of dims, strides and tile -- so one instruction describes exactly one
+    # region. group2/group3 are iterate-mode operands for the SAME tensor, not
+    # a second tensor. There is no encoding for two heterogeneous regions in
+    # one instruction, so "fused" can only mean sharing the descriptor set and
+    # being programmed per wave.
+    #
+    #   0  OFF, and the default. Hidden from the kernel name. The grouping is
+    #      left to the derivation in KernelWriterAssembly.defineTdmSgprs, which
+    #      is not one fixed grouping: it aliases B onto A and MXSB onto MXSA
+    #      under NumWaves > 1 and not UseSubtileImpl, giving {A,B} + {MXSA,MXSB},
+    #      and gives every tensor its own descriptor otherwise. 0 therefore
+    #      means "leave this alone", NOT "do not fuse".
+    #   4  {MXSA,MXSB} + {A,B}. Two fused groups on a TWO-WAY wave-parity
+    #      dispatch: s_bitcmp1_b32 s[sgprWaveIdx], 0 sends even waves down the
+    #      A / MXSA arm and odd waves down the B / MXSB arm. This is exactly
+    #      what 0 already produces on wave-separated MX shapes -- measured
+    #      byte-identical to 0 there, the name token aside -- so it changes no
+    #      assembly. What it buys is that the grouping is stated in the kernel
+    #      name and REFUSED wherever it would not be produced (NumWaves == 1,
+    #      UseSubtileImpl, no MX scales, sparse metadata) rather than silently
+    #      degrading to a different grouping under a name that claims this one.
+    #
+    # TDMSplit is orthogonal. It halves each data tensor's load into two
+    # instructions without changing which tensors share a descriptor, so a
+    # grouping named here still holds and only the instruction count moves.
+    #
+    # THE NUMBERING NEEDS SETTLING BEFORE THIS SHIPS. 0 is spent on "off", so
+    # the design table's `None` grouping -- every tensor on its own instruction
+    # -- cannot also be 0 and currently has no number. Renumbering costs
+    # nothing today and is a compatibility problem once tuning libraries carry
+    # values. The unimplemented rows keep the table's numbers provisionally:
+    #     1  `AB`      {A,B}, MX scales unfused
+    #     2  `A_MX`    {A,MXSA,MXSB} + {B}
+    #     3  `B_MX`    {B,MXSA,MXSB} + {A}
+    #     5  `paired`  {MXSA,A} + {MXSB,B}
+    # Rows 2 and 3 are realisable but NOT expressible by today's generator. A
+    # three-member group needs a three-way wave dispatch, and
+    # TensorDataMover.calculateStartAddrWaveSeparated knows only the parity
+    # split: it computes numComp = numWaves // 2 and asserts numWaves > 1. The
+    # hand-written OAI `..._fuseMXA` kernel does row 2 by branching on
+    # s_cmp_eq_u32 of the wave id against 0 and against 2, and pays load
+    # balance for it -- one wave moves all of MXSA, one all of MXSB, and two
+    # share A. Any value added here must document the dispatch it implies, or
+    # it will not survive a different NumWaves.
+    #
+    # One grouping in real use is NOT in the table and is left unnumbered on
+    # purpose: {A}, {B}, {MXSA,MXSB} -- A and B on their own descriptors with
+    # the MX scales still parity-aliased. It is what the hand-written
+    # OAI_memory_bound kernel emits, and 7d8704c8059 on
+    # users/andysu/tdm_dealias_ab already implements it, at next_free_sgpr 102
+    # against the hard 106, paying for the registers by closing runtime
+    # StaggerU for that family. That price is its own decision, so the shape is
+    # recorded here rather than numbered. It is not waiting to be rediscovered.
+    #
+    # There is deliberately no defaultBenchmarkCommonParameters entry: see the
+    # note beside TDMSplit there. An absent key is off, which keeps the full
+    # solution name and the dedup key identical to what they were before this
+    # parameter existed.
+    #
+    # Measured mapping of these values onto emitted assembly:
+    # impl_v2/handover/R37_TDM_FUSION_MAPPING_MEASURED.md, and the parameter
+    # itself in R38_TDMFUSE_PARAMETER.md.
+    "TDMFuse": [0, 4],
     # In-device layout of the MX scale tensors (MXSA/MXSB).
     # User-facing values:
     #   "NoSwizzle":       no swizzling; plain row/column layout (this is the default

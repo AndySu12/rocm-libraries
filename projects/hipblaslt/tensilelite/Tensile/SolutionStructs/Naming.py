@@ -122,9 +122,9 @@ def getKeyNoInternalArgs(state, splitGSU: bool) -> str:
 #   False -- hidden when off (current)
 #       227 pre-existing golden kernels byte-identical in NAME and in assembly.
 #       Zero characterization snapshots differ from the merge-base for naming.
-#       (One .ambr on this branch does differ, ValidParameters'
-#       test_builders_char, but that records only that PrefetchGlobalReadA/B
-#       exist as parameters, and it differs whichever way this switch is set.)
+#       (ValidParameters' test_builders_char does differ, but only because it
+#       is the roster of which parameters exist at all; it reads the same
+#       whichever way this switch is set.)
 #
 #   True -- named on every kernel
 #       227 kernels rename. Zero assembly movement, measured name-neutrally.
@@ -271,6 +271,14 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
   # baseline twin without tagging every other kernel. Same idiom as WorkGroupMappingXCC above.
   if state.get("LDSSegmentInterleave") == 1:
     requiredParametersTemp.add("LDSSegmentInterleave")
+
+  # TDMFuse names the TDM descriptor grouping, and only when one was asked for.
+  # 0 -- equivalently an absent key -- leaves the existing derivation alone,
+  # which is what every kernel built before the parameter existed already did,
+  # so naming it there would rename all of them while asserting nothing. Same
+  # idiom as LDSSegmentInterleave above.
+  if state.get("TDMFuse", 0):
+    requiredParametersTemp.add("TDMFuse")
 
   # The one place that decides whether an absent key is named. Optional
   # parameters otherwise opt IN above -- LDSSegmentInterleave and

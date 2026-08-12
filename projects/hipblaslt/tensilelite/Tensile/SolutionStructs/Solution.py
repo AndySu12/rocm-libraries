@@ -2747,6 +2747,52 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason, f"Wave-separated TDM requires NumWaves={numWaves} to be a power of two")
         return
 
+    # TDMFuse -- which tensors share one TDM descriptor set, and therefore ride
+    # on one emitted tensor_load_to_lds. See the declaration in
+    # Common/ValidParameters.py for what each value means and for the numbering
+    # problem 0 creates.
+    #
+    # 0, including the absent key, is off and derives nothing: defineTdmSgprs
+    # keeps whatever grouping it already picks. A nonzero value PINS a
+    # grouping, and pinning is only worth naming if it is also refused where it
+    # would not be produced -- a pinned grouping that quietly degrades into a
+    # different one is worse than no parameter at all, because the kernel name
+    # then asserts something untrue about the kernel.
+    tdmFuse: int = state.get("TDMFuse", 0)
+    if tdmFuse:
+      if not (state["enableTDMA"] and state["enableTDMB"]):
+        reject(state, printRejectionReason,
+               "TDMFuse=%d describes how TDM transfers share descriptors, so it needs the TDM on "
+               "both tensors (TDMInst=3); got TDMInst=%d" % (tdmFuse, state["TDMInst"]))
+        return
+      if tdmFuse == 4:
+        # Row 4 is {MXSA,MXSB} + {A,B}. defineTdmSgprs reaches it by aliasing
+        # B's descriptor onto A's and MXSB's onto MXSA's, under exactly
+        # NumWaves > 1 and not UseSubtileImpl, and the sharing is made safe by
+        # a single wave-parity branch on bit 0 of the wave index. Outside that,
+        # each tensor already owns its descriptor and this grouping does not
+        # exist to be pinned.
+        if state["NumWaves"] <= 1:
+          reject(state, printRejectionReason,
+                 "TDMFuse=4 requires wave-separated TDM (NumWaves > 1); at NumWaves=%d every "
+                 "tensor keeps its own descriptor and nothing is fused" % state["NumWaves"])
+          return
+        if state.get("UseSubtileImpl"):
+          reject(state, printRejectionReason,
+                 "TDMFuse=4 is not available with UseSubtileImpl=1, which gives each tensor its "
+                 "own descriptor to avoid reinitialising a shared one before every load")
+          return
+        if not (state["ProblemType"]["MXBlockA"] and state["ProblemType"]["MXBlockB"]):
+          reject(state, printRejectionReason,
+                 "TDMFuse=4 names the MX scale group {MXSA,MXSB}, so it requires MX scales on "
+                 "both tensors; without them the only group is {A,B}")
+          return
+        if state["enableTDMMetadata"]:
+          reject(state, printRejectionReason,
+                 "TDMFuse=4 does not describe the sparse metadata tensor, which the TDM moves on "
+                 "a third descriptor (tdmMetadataGroup0) that no value of this parameter names")
+          return
+
     # DepthU == -1?
     if state["DepthU"] == -1:
       depthuList = [1024,512,256,128,64,32,16]

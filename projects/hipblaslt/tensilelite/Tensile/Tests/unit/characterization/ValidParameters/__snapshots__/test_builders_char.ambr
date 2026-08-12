@@ -1489,6 +1489,7 @@
     'SuppressNoLoadLoop',
     'SwInstructionPrefetch',
     'SwapGlobalReadOrder',
+    'TDMFuse',
     'TDMInst',
     'TDMIterateMode',
     'TDMSplit',
@@ -2655,6 +2656,14 @@
       'head': list([
         0,
         1,
+      ]),
+      'len': 2,
+      'type': 'list',
+    }),
+    'TDMFuse': dict({
+      'head': list([
+        0,
+        4,
       ]),
       'len': 2,
       'type': 'list',

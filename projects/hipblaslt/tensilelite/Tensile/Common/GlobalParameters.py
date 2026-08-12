@@ -615,6 +615,13 @@ defaultBenchmarkCommonParameters = [
     {"UsePLRPack": [0]},
     {"TDMInst": [0]},
     {"TDMSplit": [False]},
+    # TDMFuse has no entry here on purpose. An absent key is "off", which is
+    # exactly what every kernel predating the parameter already did, so nothing
+    # it does not name moves: SolutionStructs.Naming adds the token only when
+    # the value is nonzero, and a key the solution does not carry is skipped by
+    # _getName, so the FULL solution name and the kernel dedup key are
+    # unchanged as well. A default of 0 would put TDMF0 on both, for every
+    # kernel, for a parameter that is switched off.
     {"MXScaleFormat": ["Auto"]},
     {"MXLoadInst": ["Auto"]},
     # SwInstructionPrefetch — StinkyTofu software instruction-prefetch mode (single integer):
