@@ -104,6 +104,34 @@ def decoupledSingleBuffered(ks):
     return decoupled and min(numLdsBlkA, numLdsBlkB) == 1 and max(numLdsBlkA, numLdsBlkB) > 1
 
 
+def tdmDealiasAB(ks):
+    """True when A and B get their own TDM descriptor sets instead of sharing one.
+
+    Selected only by TDMFuse=6, never derived. The shape works on any divergent
+    decoupled pair, but 6 is the only route to it so that 0 stays inert.
+
+    Costs 12 SGPRs -- Group0 is 4 and Group1 is 8, both fixed tuple widths of
+    tensor_load_to_lds -- against an architectural ceiling of 106, paid for by
+    closing runtime StaggerU in _disableUnsupportedRuntimeStaggerU.
+
+    Equal block counts keep the alias: they are byte-identical to a legacy
+    configuration today and that identity is the evidence the feature rests on.
+    MXSA/MXSB stay parity-aliased; de-aliasing all four costs another 24.
+    TDMSplit keeps the alias, because its multi-wave increment recomputes one
+    parity-selected split stride for one shared descriptor.
+    """
+    if ks.get("TDMFuse") != 6:
+        return False
+    decoupled, numLdsBlkA, numLdsBlkB = decouplePgrBlocks(ks)
+    if not (decoupled and numLdsBlkA != numLdsBlkB):
+        return False
+    if not tdmBothTensors(ks):
+        return False
+    if ks.get("TDMSplit"):
+        return False
+    return ks.get("NumWaves", 1) > 1 and not ks.get("UseSubtileImpl")
+
+
 def decoupledOneBlockBoth(ks):
     """True when both tensors are on a single LDS block inside a prefetch loop.
 

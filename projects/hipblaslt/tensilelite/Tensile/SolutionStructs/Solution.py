@@ -39,7 +39,8 @@ from Tensile.Common import assignParameterWithDefault, IsaInfo, \
                     roundUpToNearestMultiple, effectiveMatrixInstMN
 from Tensile.Common.DataType import DataType
 from Tensile.Common.DecouplePgr import pgrLevelsForTensors, ldsBlocksForPgrLevel, \
-                                       decoupledOneBlockBoth, tdmBothTensors
+                                       decoupledOneBlockBoth, tdmBothTensors, \
+                                       tdmDealiasAB, decouplePgrBlocks
 from Tensile.Common.TypeValidationErrors import ConfigTypeError
 from Tensile.SolutionStructs.LdsPadding import get_fp4_mt_config, get_fp8_mt_config, get_mxs_mt_config, \
                                                get_fp16_mt_config, get_fp32_mt_config
@@ -187,6 +188,17 @@ def _disableUnsupportedRuntimeStaggerU(state):
   # Workgroup cluster: staggerU breaks cross-WG multicast, so force the runtime
   # StaggerU path off too (KernelWriter already gates staggerUCode off for clusters).
   if state.get("ClusterDim", [1, 1]) != [1, 1]:
+    _disableRuntimeStaggerU(state)
+  # A divergent decoupled-PGR pair on the multi-wave TDM gives A and B their own
+  # descriptor sets so their fills can sit at different slots. Two descriptors
+  # cost 12 SGPRs against an architectural ceiling of 106 addressable scalars
+  # (s0..s105; MaxSgpr is 106 for ISA 12.5 and exceeding it drops the solution),
+  # and the hero shape has 6 to spare only once StaggerUIter and the four WrapU
+  # pairs go. Runtime StaggerU is what holds them: with StaggerU already 0 at
+  # compile time, SupportCustomStaggerU is the only remaining route to a nonzero
+  # value. This buys the registers by declaring that route closed, which is the
+  # same trade PAP+TDMInst==3 above already makes.
+  if tdmDealiasAB(state):
     _disableRuntimeStaggerU(state)
 
 
@@ -2791,6 +2803,38 @@ class Solution(collections.abc.Mapping):
           reject(state, printRejectionReason,
                  "TDMFuse=4 does not describe the sparse metadata tensor, which the TDM moves on "
                  "a third descriptor (tdmMetadataGroup0) that no value of this parameter names")
+          return
+
+      if tdmFuse == 6:
+        if state["NumWaves"] <= 1 or state.get("UseSubtileImpl"):
+          reject(state, printRejectionReason,
+                 "TDMFuse=6 de-aliases A from B on the wave-separated path; at NumWaves=%d or "
+                 "under UseSubtileImpl each tensor already owns its descriptor"
+                 % state["NumWaves"])
+          return
+        if state.get("TDMSplit"):
+          reject(state, printRejectionReason,
+                 "TDMFuse=6 is not available with TDMSplit, whose multi-wave increment recomputes "
+                 "one parity-selected split stride for one shared descriptor")
+          return
+        # Outside a divergent pair the de-aliased cadence is unverified:
+        # 7d8704c8059 measured only this envelope and keys the cadence on the
+        # block count through singleIsA.
+        decoupled, blkA, blkB = decouplePgrBlocks(state)
+        if not (decoupled and blkA != blkB):
+          reject(state, printRejectionReason,
+                 "TDMFuse=6 requires a divergent decoupled pair (PrefetchGlobalReadA/B resolving "
+                 "to different LDS block counts); got decoupled=%s blocks=(%d,%d)"
+                 % (decoupled, blkA, blkB))
+          return
+        if not (state["ProblemType"]["MXBlockA"] and state["ProblemType"]["MXBlockB"]):
+          reject(state, printRejectionReason,
+                 "TDMFuse=6 names the MX scale group {MXSA,MXSB}, so it requires MX scales on "
+                 "both tensors")
+          return
+        if state["enableTDMMetadata"]:
+          reject(state, printRejectionReason,
+                 "TDMFuse=6 does not describe the sparse metadata tensor")
           return
 
     # DepthU == -1?

@@ -1238,14 +1238,17 @@ validParameters = { # we need to make sure this matches develop
     # share A. Any value added here must document the dispatch it implies, or
     # it will not survive a different NumWaves.
     #
-    # One grouping in real use is NOT in the table and is left unnumbered on
-    # purpose: {A}, {B}, {MXSA,MXSB} -- A and B on their own descriptors with
-    # the MX scales still parity-aliased. It is what the hand-written
-    # OAI_memory_bound kernel emits, and 7d8704c8059 on
-    # users/andysu/tdm_dealias_ab already implements it, at next_free_sgpr 102
-    # against the hard 106, paying for the registers by closing runtime
-    # StaggerU for that family. That price is its own decision, so the shape is
-    # recorded here rather than numbered. It is not waiting to be rediscovered.
+    #   6  {A} + {B} + {MXSA,MXSB}. Three descriptor sets: A and B each own
+    #      one, the MX scales stay parity-aliased on a third. NOT IN THE DESIGN
+    #      TABLE -- the table runs 0..5 and this shape is absent from it, so 6
+    #      is the first number above the table rather than a table row. It is
+    #      what the hand-written OAI_memory_bound kernel emits. Costs 12 SGPRs
+    #      for B's own set, netting +2 to 102 against the hard 106 once the
+    #      aliased increment and the stagger gate are subtracted, and it is
+    #      paid for by closing runtime StaggerU for this family --  a real
+    #      capability reduction, not a refactor, and not reversible at this
+    #      budget. Requires a divergent decoupled pair: that is the envelope
+    #      7d8704c8059 verified, and the cadence logic keys on the block count.
     #
     # There is deliberately no defaultBenchmarkCommonParameters entry: see the
     # note beside TDMSplit there. An absent key is off, which keeps the full
@@ -1255,7 +1258,7 @@ validParameters = { # we need to make sure this matches develop
     # Measured mapping of these values onto emitted assembly:
     # impl_v2/handover/R37_TDM_FUSION_MAPPING_MEASURED.md, and the parameter
     # itself in R38_TDMFUSE_PARAMETER.md.
-    "TDMFuse": [0, 4],
+    "TDMFuse": [0, 4, 6],
     # In-device layout of the MX scale tensors (MXSA/MXSB).
     # User-facing values:
     #   "NoSwizzle":       no swizzling; plain row/column layout (this is the default

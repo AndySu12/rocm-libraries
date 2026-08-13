@@ -2664,8 +2664,9 @@
       'head': list([
         0,
         4,
+        6,
       ]),
-      'len': 2,
+      'len': 3,
       'type': 'list',
     }),
     'TDMInst': dict({
