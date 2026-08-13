@@ -716,19 +716,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
   # prefetched read that opens the next one, i.e. sub-iteration
   # LoopIters - numItersPLR.
   #
-  # Both slots emit the same module under complementary wave-parity guards,
-  # which works because the load and its increment are already parity
-  # separated: one shared tensor_load_to_lds resolving to A on even waves and B
-  # on odd. Every wave still issues exactly one fill and one advance per
-  # iteration, so round counts, the post-loop pointer, the NoLoadLoop and the
-  # tail are all unchanged -- the last body iteration's late fill already
-  # delivers the tile the NoLoadLoop reads.
+  # Both slots emit the same module under complementary wave-parity guards, so
+  # every wave still issues exactly one fill and one advance per iteration and
+  # round counts, the post-loop pointer, the NoLoadLoop and the tail are all
+  # unchanged -- the last body iteration's late fill already delivers the tile
+  # the NoLoadLoop reads.
   #
-  # This reaches divergent pairs only, and cannot be extended to a pair where
-  # both tensors are one-block: the window above exists because the other
-  # tensor is double-buffered and keeps the pipeline fed across the move, and
-  # (1,1) has no such partner. (1,1) is broken for that reason and it is
-  # pre-existing -- see _dcpDivergent.
+  # This reaches divergent pairs only. The window exists because the other
+  # tensor is double-buffered and keeps the pipeline fed across the move, so it
+  # cannot be extended to a pair where both tensors are one-block -- see the
+  # (1,1) TODO in Solution.assignDerivedParameters.
   ##############################################################################
   def _dcpScheduleSingleBufferedFillLate(self, kernel):
     if not self._dcpDivergent(kernel):
@@ -742,8 +739,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if self.codes.globalReadA is None or not self.codes.globalReadA.middle.itemsSize():
       return
 
-    # Preconditions are pinned by the reject in Solution.py, so a violation here
-    # is an emitter bug rather than an unsupported solution.
     assert self.isTdmWaveSeparated(kernel), \
       "decoupled PGR with divergent block counts needs the wave-separated TDM descriptor"
     lateIter = kernel["LoopIters"] - self.states.numItersPLR
@@ -766,44 +761,37 @@ class KernelWriter(metaclass=abc.ABCMeta):
           self._emitTdmWaveParitySCC(mod, kernel, tmp.idx, "check wave parity")
 
     late = Module("TDM decoupled late fill %s" % singleTc)
-    # Every wave reads the single-buffered block this iteration, so the refill
-    # is a write-after-read against the whole workgroup, not just this wave.
-    # The read-after-write against the next iteration's prefetched read is
-    # closed by the sync already at the head of this sub-iteration.
+    # Every wave reads the single-buffered block this iteration, so the refill is
+    # a write-after-read against the whole workgroup, not just this wave. The
+    # read-after-write against the next iteration's prefetched read is already
+    # closed by the sync at the head of this sub-iteration.
     late.add(SWaitCnt(dscnt=0, comment="TDM decoupled: all ds_reads done before %s refill" % singleTc))
     late.add(SBarrier(comment="TDM decoupled: signal+wait done reading %s block" % singleTc))
 
     if self.tdmDealiasAB(kernel):
       # A and B hold their own descriptors, so each fill is one instruction
-      # already guarded to the waves that carry that tensor. That is what makes
-      # the re-slot a move rather than a duplication: the single-buffered
-      # tensor's fill goes to the late slot on its own, the other stays at the
-      # top, and neither needs a guard added because the guard it carries is the
-      # one that selects it.
+      # already guarded to the waves that carry that tensor and the re-slot is a
+      # move rather than a duplication. Everything else in the group still has to
+      # appear at both slots under complementary guards:
       #
-      # Everything else in the group still has to appear at both slots under
-      # complementary guards, and it is a correctness requirement, not tidiness:
-      #
-      #   - the MX scale pair is still parity-aliased, so its fill is still one
+      #   - the MX scale pair is still parity-aliased, so its fill is one
       #     instruction serving both scales. MXSA follows A's block count and
       #     MXSB follows B's, so the copy that runs late is the one on the
       #     single-buffered parity.
-      #   - the descriptor advances must stay with the fill they follow. A wave
-      #     fills from the pointer it holds and then advances it; leaving the
-      #     advance at the top while the fill moves late would have the late fill
-      #     read from an address already moved on one iteration. Measured: doing
-      #     that fails FFM validation for every K > DepthU (first failure
-      #     512x512x1x544) while K <= DepthU still passes, because the body has
-      #     to execute for the ordering to matter.
+      #   - a descriptor advance must stay with the fill it follows. A wave fills
+      #     from the pointer it holds and then advances it, so leaving the advance
+      #     at the top while the fill moves late has the late fill read from an
+      #     address already moved. That fails FFM validation for every
+      #     K > DepthU, first at 512x512x1x544.
       singleFill = self.codes.globalReadA if singleIsA else self.codes.globalReadB
       doubleFill = self.codes.globalReadB if singleIsA else self.codes.globalReadA
       rest = Module("TDM decoupled per-parity fill group")
       kept = []
       for item in src.items():
         if item is doubleFill:
-          kept.append(item)          # stays at the top, on its own guard
+          kept.append(item)
         elif item is singleFill:
-          continue                   # moves to the late slot, on its own guard
+          continue
         else:
           rest.add(item)
       hasRest = rest.itemsSize() > 0
@@ -3309,11 +3297,11 @@ class KernelWriter(metaclass=abc.ABCMeta):
             tPA = None
           if kernel["DirectToVgprB"]:
             tPB = None
-        # Decoupled PGR advances both tensors here, like legacy. A
-        # single-buffered tensor is made legal by where its fill sits in the
-        # loop body (_dcpScheduleSingleBufferedFillLate), not by lagging its
-        # pointer: holding one side's increment here puts that tensor a tile
-        # behind from the second unrolled iteration onwards.
+        # Decoupled PGR advances both tensors here, like legacy: a
+        # single-buffered tensor is made legal by where its fill sits in the loop
+        # body (_dcpScheduleSingleBufferedFillLate), and holding one side's
+        # increment back here would instead put that tensor a tile behind from the
+        # second unrolled iteration onwards.
         module.add(self.globalReadIncrementAB(kernel, tPA, tPB, self.states.unrollIdx, pfi))
         # swap Tensor memToken
         self.states.ldsTensorTokenIdx = \
@@ -4063,8 +4051,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 pointerLWCode.add(self.localWriteSwapOffsets(kernel, expand, tensorParametersB["MX"]))
             if kernel["enableTDMB"]:
               #TODO: TDM refactor
-              # B owns an LDS address of its own whenever its descriptor is its
-              # own, so it needs its own swap in exactly those cases.
               if kernel["NumWaves"] == 1 or self.tdmDealiasAB(kernel):
                 pointerLWCode.addComment1("tdm swap offsets b")
                 pointerLWCode.add(self.tdmSwapLdsOffset(kernel, tensorParametersB))
@@ -7202,28 +7188,24 @@ class KernelWriter(metaclass=abc.ABCMeta):
     #   route the offset is always zero, yet StaggerUIter and the four WrapU
     #   pairs stay allocated across the whole main loop; on the hero shape that
     #   is the 12 SGPRs the second descriptor set needs to fit under 106.
-    #   Solution._disableUnsupportedRuntimeStaggerU closes the runtime route for
-    #   exactly this family, and removeGROffsetsVariableSgprsFromPool already
-    #   tests the same predicate as needsStaggerSgprs.
     #
-    #   Deliberately narrowed to the de-aliased family rather than applied to
-    #   every solution whose stagger is unreachable. The wider gate also reaches
-    #   PAP+TDMInst==3 and PrefetchGL2>0, and there StreamK's constant-increment
-    #   substitution (useConstSgprGlobalReadIncs, taken only when staggerUCode is
-    #   false) turns GlobalReadIncs* into assembler constants while the
-    #   wave-separated TDM setup still names them as SGPRs. Measured on
-    #   Tests/common/streamk/gfx1250/core/sk_mxf4gemm_pap_prefetchgl2.yaml: the
-    #   wider gate makes every kernel there fail to assemble with
-    #   "expected absolute expression". That is a pre-existing incompatibility
-    #   between two features this change does not own, so this does not reach it.
+    #   Narrowed to the de-aliased family rather than applied to every solution
+    #   whose stagger is unreachable. The wider gate also reaches PAP+TDMInst==3
+    #   and PrefetchGL2>0, and there StreamK's constant-increment substitution
+    #   (useConstSgprGlobalReadIncs, taken only when staggerUCode is false) turns
+    #   GlobalReadIncs* into assembler constants while the wave-separated TDM
+    #   setup still names them as SGPRs: on
+    #   Tests/common/streamk/gfx1250/core/sk_mxf4gemm_pap_prefetchgl2.yaml the
+    #   wider gate makes every kernel there fail to assemble with "expected
+    #   absolute expression".
     #
     #   CustomMainLoopSchedule is excluded because its main loop is emitted from
     #   a fixed positional table (Components/CustomSchedule.py) whose
     #   GRIncA/GRIncB slot lists are all authored at the stagger-enabled length
     #   of nine, and scheduleInst indexes the emitted instructions by slot
-    #   position. Dropping the wrap leaves a six-instruction increment the table
-    #   cannot address. CMS is gfx950-only and the TDM is not, so the two cannot
-    #   meet today; the clause is here so that stays true if either moves.
+    #   position, so dropping the wrap leaves a six-instruction increment the
+    #   table cannot address. CMS is gfx950-only and the TDM is not, so the two
+    #   cannot meet today; the clause is here so that stays true if either moves.
     staggerUUnreachable = \
         not (kernel["StaggerU"] > 0 or
              kernel["InternalSupportParams"]["SupportCustomStaggerU"]) and \
@@ -7539,13 +7521,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.states.useCommonSgprSwap = True
     # set memory token by LDS buffer setting
     self.states.memTokenLdsBufferMeta = 4
-    # A single-buffered tensor reads and refills the same bytes, so the two
-    # buffer tokens have to collapse to one or the dependency tracker sees the
-    # refill land on a buffer nothing read and postMainLoopBarrierCheckAndReset
-    # emits no barrier for a real write-after-read. Under decoupled PGR only
-    # one tensor may be single-buffered, but the wave-separated
-    # tensor_load_to_lds is shared, so the one token has to cover both.
-    # Collapsing can only add barriers, never remove a required one.
+    # A single-buffered tensor reads and refills the same bytes, so the two buffer
+    # tokens have to collapse to one or the dependency tracker sees the refill land
+    # on a buffer nothing read and postMainLoopBarrierCheckAndReset emits no
+    # barrier for a real write-after-read. Only one tensor may be single-buffered,
+    # but the wave-separated tensor_load_to_lds is shared, so the one token has to
+    # cover both. Collapsing can only add barriers, never remove a required one.
     if kernel["1LDSBuffer"] or decoupledSingleBuffered(kernel) or decoupledOneBlockBoth(kernel):
       self.states.memTokenLdsBuffer0 = 0
       self.states.memTokenLdsBuffer1 = 0

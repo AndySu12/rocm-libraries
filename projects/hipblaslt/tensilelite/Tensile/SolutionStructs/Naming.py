@@ -272,19 +272,15 @@ def _getName(state, requiredParameters: frozenset, splitGSU: bool, ignoreInterna
   if state.get("LDSSegmentInterleave") == 1:
     requiredParametersTemp.add("LDSSegmentInterleave")
 
-  # TDMFuse names the TDM descriptor grouping, and only when one was asked for.
-  # 0 -- equivalently an absent key -- leaves the existing derivation alone,
-  # which is what every kernel built before the parameter existed already did,
-  # so naming it there would rename all of them while asserting nothing. Same
-  # idiom as LDSSegmentInterleave above.
+  # TDMFuse names the grouping only when one was asked for: 0, equivalently an
+  # absent key, leaves the existing derivation alone, so naming it there would
+  # rename every pre-existing kernel while asserting nothing.
   if state.get("TDMFuse", 0):
     requiredParametersTemp.add("TDMFuse")
 
-  # The one place that decides whether an absent key is named. Optional
-  # parameters otherwise opt IN above -- LDSSegmentInterleave and
-  # SpaceFillingAlgo both do -- and _NAME_ABSENT_KEYS is the switch for the
-  # keys that have a defined "not specified" level instead. See its comment for
-  # the measured cost of each setting.
+  # Optional parameters otherwise opt IN above; _NAME_ABSENT_KEYS is the switch
+  # for the keys that have a defined "not specified" level instead. See its
+  # comment for the measured cost of each setting.
   for key in sorted(requiredParametersTemp):
     if key == "CustomKernelName":
       continue
