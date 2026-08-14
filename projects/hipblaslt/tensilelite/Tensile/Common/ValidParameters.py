@@ -1236,6 +1236,23 @@ validParameters = { # we need to make sure this matches develop
     # must document the dispatch it implies, or it will not survive a different
     # NumWaves.
     "TDMFuse": [0, 4, 6],
+    # TDMWaveSpread -- how many wave-components each tensor's TDM transfer is
+    # split into. This is a DIFFERENT AXIS from TDMFuse, which names only the
+    # grouping: two configurations can share a grouping and still split each
+    # tensor across a different number of waves. TDMFuse cannot express that, so
+    # the count travels here instead of as another TDMFuse row.
+    #   0  (or absent) today's parity split. Every tensor takes
+    #      numWaves // 2 components, component id WaveIdx >> 1. Under the parity
+    #      pair that means A rides the even waves and B the odd ones.
+    #   1  A and B each take numWaves components -- component id is WaveIdx
+    #      itself, so every wave carries a quarter of each at NumWaves=4 -- while
+    #      the MX scales keep the parity split, MXSA on waves 0 and 2 and MXSB on
+    #      waves 1 and 3. This is the 2/2/4 overlay the hand-written OAI
+    #      reference kernel actually uses, read out of its descriptor setup.
+    #      Requires the de-aliased {A} + {B} + {MXSA,MXSB} grouping: with A and B
+    #      sharing one descriptor set there is no way for both to be on all four
+    #      waves, so it is rejected rather than silently degraded.
+    "TDMWaveSpread": [0, 1],
     # In-device layout of the MX scale tensors (MXSA/MXSB).
     # User-facing values:
     #   "NoSwizzle":       no swizzling; plain row/column layout (this is the default
