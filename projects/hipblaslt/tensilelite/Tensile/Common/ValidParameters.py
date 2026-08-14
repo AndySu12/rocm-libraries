@@ -1210,6 +1210,24 @@ validParameters = { # we need to make sure this matches develop
     #      would not be produced (NumWaves == 1, UseSubtileImpl, no MX scales,
     #      sparse metadata) rather than degrading silently under a name that
     #      claims it.
+    #   2  {A,MXSA,MXSB} + {B}. Two descriptor sets on a THREE-WAY dispatch of
+    #      the shared set, and it is the grouping the hand-written OAI
+    #      deliverable uses (it aliases sgprtdmAGroup0 and sgprtdmMXSBGroup0
+    #      onto sgprtdmMXSAGroup0 and keeps sgprtdmBGroup0 separate).
+    #
+    #      The dispatch is uneven, which is the whole point and the reason the
+    #      parity split cannot express it. At NumWaves=4 two waves carry A, ONE
+    #      carries MXSA, ONE carries MXSB, and -- because B is alone in its set
+    #      and so has no partner to divide against -- ALL FOUR carry B. B's
+    #      per-wave row assignment therefore CHANGES even though B's arm reads
+    #      as untouched: its component id becomes the full wave index over four
+    #      components, not waveIdx >> 1 over two.
+    #
+    #      Costs the same 24 SGPRs as the default pairing (two sets of 4+8).
+    #
+    #      Restricted to NumWaves == 4: the 1/1/2 split names four waves
+    #      explicitly, and 4 does not divide by 3, so the split is a remainder
+    #      policy for three group members rather than an even partition.
     #   6  {A} + {B} + {MXSA,MXSB}. Three descriptor sets: A and B each own one,
     #      the MX scales stay parity-aliased on a third. Not in the design table,
     #      which runs 0..5, so 6 sits above the table rather than in it. Costs 12
@@ -1226,16 +1244,18 @@ validParameters = { # we need to make sure this matches develop
     # problem once tuning libraries carry values. The unimplemented rows keep the
     # table's numbers provisionally:
     #     1  `AB`      {A,B}, MX scales unfused
-    #     2  `A_MX`    {A,MXSA,MXSB} + {B}
     #     3  `B_MX`    {B,MXSA,MXSB} + {A}
     #     5  `paired`  {MXSA,A} + {MXSB,B}
-    # Rows 2 and 3 are realisable but not expressible by today's generator: a
-    # three-member group needs a three-way wave dispatch, and
-    # TensorDataMover.calculateStartAddrWaveSeparated knows only the parity split
-    # (numComp = numWaves // 2, asserting numWaves > 1). Any value added here
-    # must document the dispatch it implies, or it will not survive a different
-    # NumWaves.
-    "TDMFuse": [0, 4, 6],
+    # Row 3 is the mirror of 2 and is realisable the same way, but is not
+    # implemented: it needs B's share of the shared set split across two waves
+    # against A alone, and nothing measured asks for it.
+    #
+    # Every value here states the wave dispatch it implies, because a grouping
+    # is only half the specification -- the parity split and the 1/1/2 split
+    # produce the same descriptor sets and different assembly. The count itself
+    # travels on TDMWaveSpread, which is why 2 and 6 differ in grouping while 6
+    # and TDMWaveSpread=1 differ only in count.
+    "TDMFuse": [0, 2, 4, 6],
     # TDMWaveSpread -- how many wave-components each tensor's TDM transfer is
     # split into. This is a DIFFERENT AXIS from TDMFuse, which names only the
     # grouping: two configurations can share a grouping and still split each

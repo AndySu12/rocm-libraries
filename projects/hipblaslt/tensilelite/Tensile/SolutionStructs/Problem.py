@@ -584,6 +584,13 @@ _validGEMMTypes = [
     ("F6", "F8", "S", "S"),
     ("F8", "F4", "S", "S"),
     ("F4", "F8", "S", "S"),
+    # FP8 output for the F8xF4 pair, which is what the OAI reference computes
+    # (Cijk_..._F8F4F8S). The pair was the only MX combination in this table
+    # restricted to S output while ("F4","F4","F8","S") and ("F6","F6","F8","S")
+    # were already admitted, so an F8-output F8xF4 solution could not be named
+    # and the arms silently solved a different problem.
+    ("F8", "F4", "F8", "S"),
+    ("F4", "F8", "F8", "S"),
     ("F6", "F4", "S", "S"),
     ("F4", "F6", "S", "S"),
     ("F6", "F4", "B", "S"),
