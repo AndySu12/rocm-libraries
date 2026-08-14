@@ -28,15 +28,17 @@
 and nothing else in-tree pins it down, so a silent change to the map is a
 silent change to every decoupled kernel's LDS footprint.
 
-The two guards below it are here for the same reason. Both were wrong on a
-pushed branch, and both were wrong in the way a guard fails quietly: one let a
-solution through validation to die on an emitter assertion, the other resolved
-a pair away before the reject that contradicted it could see it. Neither shows
+The guards below it are here for the same reason. Each was wrong on a pushed
+branch, and each was wrong in the way a guard fails quietly: some let a
+solution through validation to die on an emitter assertion, one resolved a pair
+away before the reject that contradicted it could see it, and one warned about
+a kernel that computes wrong results instead of dropping it. None of that shows
 up in a build that only asks whether kernels came out.
 """
 import pytest
 
 from Tensile.Common.DecouplePgr import (
+    decoupledOneBlockBoth,
     decouplePgrBlocks,
     decoupledSingleBuffered,
     divergentPairUnsupportedReason,
@@ -119,7 +121,12 @@ def test_legacy_solution_is_not_decoupled():
 
 
 def _divergentSolution(**overrides):
-    """A (1,2) pair with every precondition of the late fill satisfied."""
+    """A (1,2) pair with every precondition of the late fill satisfied.
+
+    The loop shape is carried because one precondition is about the number of
+    sub-iterations: DepthU 512 over MatrixInstK 128 is LoopIters 4, so the
+    PrefetchLocalRead of 1 here sits well inside it.
+    """
     ks = {
         "PrefetchGlobalRead": 1,
         "PrefetchGlobalReadA": 1,
@@ -127,6 +134,13 @@ def _divergentSolution(**overrides):
         "ScheduleIterAlg": 0,
         "PrefetchLocalRead": 1,
         "NumWaves": 4,
+        "DepthU": 512,
+        "LocalSplitU": 1,
+        "InnerUnroll": 1,
+        "MatrixInstK": 128,
+        "EnableMatrixInstruction": True,
+        "ClusterLocalRead": 1,
+        "ForceUnrollSubIter": False,
     }
     ks.update(overrides)
     return ks
@@ -144,6 +158,7 @@ def _divergentSolution(**overrides):
         ({"PrefetchGlobalReadB": 3}, "more than two LDS blocks"),
         ({"ScheduleIterAlg": 3}, "ScheduleIterAlg=0"),
         ({"PrefetchLocalRead": 0}, "PrefetchLocalRead must be at least 1"),
+        ({"PrefetchLocalRead": 4}, "is not below LoopIters=4"),
         ({"NumWaves": 1}, "NumWaves > 1"),
     ],
 )
@@ -206,3 +221,118 @@ def test_equal_pair_degenerates_to_scalar(pgrA, pgrB, oneLdsBuffer, degenerates)
 def test_legacy_solution_does_not_degenerate():
     """There is no pair to resolve away, whatever 1LDSBuffer says."""
     assert equalPairDegeneratesToScalar({"PrefetchGlobalRead": 2, "1LDSBuffer": 1}) is False
+
+
+# PrefetchLocalRead at or above LoopIters is rewritten to 0 by
+# Solution.assignDerivedParameters, after this reject has already looked at it,
+# so the clause that rejects 0 outright never sees the 0 that gets made. Every
+# cell here was measured on the emitter: below LoopIters it builds, at or above
+# it asserted. LoopIters is DepthU / LocalSplitU / InnerUnroll / MatrixInstK,
+# which for MatrixInstK 128 is 4, 2 and 1 at DepthU 512, 256 and 128.
+@pytest.mark.parametrize(
+    "depthU, prefetchLocalRead, rejected",
+    [
+        (512, 1, False),
+        (512, 2, False),
+        (512, 3, False),
+        (512, 4, True),
+        (512, 5, True),
+        (512, 6, True),
+        (512, 7, True),
+        (512, 8, True),
+        (256, 1, False),
+        (256, 2, True),
+        (256, 3, True),
+        (256, 4, True),
+        (256, 5, True),
+        (128, 1, True),
+    ],
+)
+def test_prefetch_local_read_below_loop_iters(depthU, prefetchLocalRead, rejected):
+    reason = divergentPairUnsupportedReason(
+        _divergentSolution(DepthU=depthU, PrefetchLocalRead=prefetchLocalRead)
+    )
+
+    if rejected:
+        assert reason is not None and "LoopIters" in reason
+    else:
+        assert reason is None
+
+
+def test_prefetch_local_read_rewrite_is_rejected_not_asserted():
+    """Reaching PrefetchLocalRead=0 by rewrite has to reject like writing it does.
+
+    Both routes end at the same kernel, so they cannot end at different
+    outcomes. Writing 0 rejected already; arriving at 0 through the rewrite ran
+    on to KernelWriter._dcpScheduleSingleBufferedFillLate and asserted.
+    """
+    written = divergentPairUnsupportedReason(_divergentSolution(PrefetchLocalRead=0))
+    rewritten = divergentPairUnsupportedReason(
+        _divergentSolution(DepthU=256, PrefetchLocalRead=2)
+    )
+
+    assert written is not None
+    assert rewritten is not None
+
+
+def test_prefetch_local_read_guard_is_only_for_the_rewrite():
+    """No rewrite, no reject: the guard covers that rewrite and nothing wider.
+
+    The rewrite is conditional on ClusterLocalRead, so with it off the value
+    survives and the emitter is not handed a 0 it did not ask for. Rejecting
+    there would drop solutions that were never affected.
+    """
+    ks = _divergentSolution(DepthU=256, PrefetchLocalRead=2, ClusterLocalRead=0)
+
+    assert divergentPairUnsupportedReason(ks) is None
+
+
+def test_more_lds_blocks_masks_the_loop_iters_guard():
+    """(1,4) at DepthU 128 is caught by block count first, not by this guard.
+
+    Worth pinning because it cuts the other way from most masking: the block
+    count clause is what keeps aggressive pairs away from the assertion today,
+    so relaxing it without this guard in place would widen the assertion rather
+    than narrow it.
+    """
+    aggressive = _divergentSolution(DepthU=128, PrefetchGlobalReadB=4, PrefetchLocalRead=1)
+
+    assert "more than two LDS blocks" in divergentPairUnsupportedReason(aggressive)
+
+
+# Both tensors on one LDS block computes wrong results from K = 2*DepthU, so
+# every spelling of it has to be rejected. A level of 0 and a level of 1 are
+# both one block, which makes (0,1) and (1,0) the same kernel as (1,1) rather
+# than near neighbours of it -- they emit byte-identical assembly.
+@pytest.mark.parametrize(
+    "pgrA, pgrB, oneBlockBoth",
+    [
+        (1, 1, True),
+        (0, 1, True),
+        (1, 0, True),
+        (0, 0, False),
+        (1, 2, False),
+        (2, 1, False),
+        (2, 2, False),
+    ],
+)
+def test_decoupled_one_block_both(pgrA, pgrB, oneBlockBoth):
+    ks = {
+        "PrefetchGlobalRead": max(pgrA, pgrB),
+        "PrefetchGlobalReadA": pgrA,
+        "PrefetchGlobalReadB": pgrB,
+    }
+
+    assert decoupledOneBlockBoth(ks) is oneBlockBoth
+
+
+def test_legacy_one_block_is_out_of_reach_of_the_pair_guard():
+    """The identical legacy kernel is not this guard's to reject.
+
+    PrefetchGlobalRead=1 with 1LDSBuffer=1 emits assembly byte-identical to the
+    (1,1) pair and carries the same defect, but it is selected without any
+    per-tensor parameter and predates this feature. Rejecting it here would be
+    a guard on the pair keys reaching past the pair keys; AIHPBLAS-4159 covers
+    fixing the shared emit properly.
+    """
+    assert decoupledOneBlockBoth({"PrefetchGlobalRead": 1, "1LDSBuffer": 1}) is False

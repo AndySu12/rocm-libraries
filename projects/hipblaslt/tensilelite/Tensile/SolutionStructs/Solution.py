@@ -5204,30 +5204,42 @@ class Solution(collections.abc.Mapping):
                  "into, and this solution has none: %s. Tracking: AIHPBLAS-4159."
                  % (numLdsBlkA, numLdsBlkB, dcpUnsupported))
           return
-      # TODO(AIHPBLAS-4159): both tensors on a single LDS block builds and fits,
-      # then computes wrong results from K = 2*DepthU -- 12 of 24 rows wrong on an
-      # FFM sweep, the boundary between K=992 and K=1024 at DepthU 512. The defect
-      # is in the legacy one-block path as much as in this one: PrefetchGlobalRead=1
-      # with 1LDSBuffer=1 selects the same emit and fails identically on a tree
-      # without this feature, so whoever fixes it has to fix PrefetchGlobalRead,
-      # PrefetchGlobalReadA and PrefetchGlobalReadB together -- fixing only the
-      # decoupled half would leave the legacy spelling quietly broken.
+      # Both tensors on a single LDS block builds and fits, then computes wrong
+      # results from K = 2*DepthU: 12 of 24 rows wrong on an FFM sweep, the
+      # boundary sitting between K=992 and K=1024 at DepthU 512, and on silicon
+      # every OAI K at DepthU 256 and 512 wrong in almost every element.
       #
       # The mechanism that makes the divergent case correct does not carry over:
       # _dcpScheduleSingleBufferedFillLate relocates the single-buffered tensor's
       # fill into the slot after that tensor's last read of the block, and that
       # slot exists only because the other tensor is double-buffered and keeps the
       # pipeline fed meanwhile. With both tensors on one block there is no partner
-      # and so no such slot.
+      # and so no such slot, so the fill of one trip through the unrolled loop
+      # overwrites the block the previous trip is still reading. One trip cannot
+      # reach that, and the tail loop does not fill, which is why the sweep is
+      # clean at K=992 and wrong at K=1024: the threshold is two full trips, and
+      # K = 2*DepthU exactly, not merely K > DepthU. Under GSU or StreamK it is
+      # the K each workgroup is given that has to clear it, not the problem's.
+      #
+      # (0,1) and (1,0) are rejected with (1,1): all three emit byte-identical
+      # assembly, since a level of 0 and a level of 1 are both one block.
+      #
+      # TODO(AIHPBLAS-4159): the legacy spelling of this is still broken and this
+      # guard cannot reach it. PrefetchGlobalRead=1 with 1LDSBuffer=1 emits assembly
+      # byte-identical to this pair, and is selected without any per-tensor
+      # parameter, so it fails the same way on a tree without this feature. Fixing
+      # the defect itself has to cover PrefetchGlobalRead, PrefetchGlobalReadA and
+      # PrefetchGlobalReadB together; rejecting here only stops this feature from
+      # adding a second way to ask for it.
       if decoupledOneBlockBoth(state):
-        printWarning(
-          "PrefetchGlobalReadA/B: PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u put "
-          "both tensors on a single LDS block. This builds and fits, but computes wrong "
-          "results from K = 2*DepthU. It is not particular to the per-tensor spelling: "
-          "legacy PrefetchGlobalRead=1 with 1LDSBuffer=1 selects the same one-block path "
-          "and fails the same way without this feature, so it is left as it is rather "
-          "than half-fixed. Tracking: AIHPBLAS-4159."
-          % (pgrA, pgrB))
+        reject(state, printRejectionReason,
+               "PrefetchGlobalReadA/B: PrefetchGlobalReadA=%u and PrefetchGlobalReadB=%u put "
+               "both tensors on a single LDS block, which builds and fits but computes wrong "
+               "results from K = 2*DepthU, because each iteration's fill overwrites the block "
+               "the previous one is still reading and there is no double-buffered partner to "
+               "hide it behind. Give at least one tensor 2. Tracking: AIHPBLAS-4159."
+               % (pgrA, pgrB))
+        return
 
     # check for auto DtlPlusLdsBuf
     if state["DtlPlusLdsBuf"] == -1:

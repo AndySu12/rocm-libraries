@@ -133,6 +133,32 @@ def divergentPairUnsupportedReason(ks):
     if ks["PrefetchLocalRead"] < 1:
         return ("PrefetchLocalRead must be at least 1 so a sub-iteration exists "
                 "between the last local read and the pre-read sync")
+    # PrefetchLocalRead >= LoopIters reaches that same state by another route:
+    # Solution.assignDerivedParameters rewrites PrefetchLocalRead to 0 when
+    # ClusterLocalRead is set, and that rewrite runs after this call. So the
+    # clause above sees the value the user wrote, passes it, and the emitter
+    # then meets the 0. Supplying 0 rejects; arriving at 0 rewrote and asserted.
+    #
+    # LoopIters is recomputed rather than read because state["LoopIters"] is
+    # assigned after this call -- absent on the first DepthU tried, and stale on
+    # every one after. This mirrors that derivation.
+    #
+    # ScheduleIterAlg=0 above already excludes the _ScheduleIterAlg == 2 arm of
+    # the rewrite's condition, so only the other two are re-tested here.
+    #
+    # The block-count clause at the top of this function currently hides this
+    # for aggressive pairs: (1,4) and (4,1) at DepthU 128 also have
+    # PrefetchLocalRead >= LoopIters, and are rejected there before reaching
+    # here. Relaxing that clause without keeping this one widens the assertion.
+    loopIters = ks["DepthU"] // ks["LocalSplitU"] // ks["InnerUnroll"]
+    if ks.get("EnableMatrixInstruction", True):
+        loopIters //= ks["MatrixInstK"]
+    if (ks["PrefetchLocalRead"] >= loopIters
+            and ks.get("ClusterLocalRead", 1)
+            and not ks.get("ForceUnrollSubIter", False)):
+        return ("PrefetchLocalRead=%u is not below LoopIters=%u, and is rewritten to 0 "
+                "after this check, leaving no sub-iteration between the last local read "
+                "and the pre-read sync" % (ks["PrefetchLocalRead"], loopIters))
     # The relocated fill and the one it replaces are emitted under complementary
     # wave-parity guards, and parity only selects a tensor on the wave-separated
     # descriptor -- KernelWriterAssembly.isTdmWaveSeparated, which is both
