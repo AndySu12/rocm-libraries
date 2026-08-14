@@ -3152,8 +3152,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # de-aliased A/B pair, whose two fills are each parity-guarded.
       if (kernel["enableTDMA"] or kernel["enableTDMB"]) and not kernel["ClusterBarrier"] \
           and not kernel.get("UseSubtileImpl") \
-          and not (self.states.staggerUCode and self.isTdmWaveSeparated(kernel)) \
-          and not tdmDealiasAB(kernel):
+          and not self.isTdmWaveIdxLive(kernel):
         module.add(self.undefineSgpr("WaveIdx"))
 
       ###########################################################################
@@ -7189,6 +7188,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
        disableStaggerForMxPap or \
        kernel["UseSubtileImpl"] or \
        clusterEnabled(kernel["ClusterDim"]):
+      self.states.staggerUCode = False
+    # StaggerU is disabled on gfx950 and gfx1250 by the platform owners, so a
+    # solution asking for StaggerU=0 must not keep the machinery alive on the
+    # strength of the runtime custom-stagger flag: staggerUCode was set without
+    # ever consulting either the StaggerU parameter or SupportCustomStaggerU, so
+    # StaggerU=0 still allocated StaggerUIter and the four WrapU pairs and still
+    # emitted wrap code no kernel would execute.
+    if kernel["StaggerU"] == 0:
       self.states.staggerUCode = False
     
     self.states.tailloopInNllmaxUnit = 1
