@@ -4075,7 +4075,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 pointerLWCode.add(self.localWriteSwapOffsets(kernel, expand, tensorParametersB["MX"]))
             if kernel["enableTDMB"]:
               #TODO: TDM refactor
-              if kernel["NumWaves"] == 1 or self.tdmDealiasAB(kernel):
+              if kernel["NumWaves"] == 1 or self.tdmSeparateABDescriptors(kernel):
                 pointerLWCode.addComment1("tdm swap offsets b")
                 pointerLWCode.add(self.tdmSwapLdsOffset(kernel, tensorParametersB))
             elif not kernel["NoLdsWriteCode"]:
@@ -4964,7 +4964,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
               pointerLWCode.add(self.localWriteSwapOffsets(kernel, expand, tensorParametersB["MX"]))
           if kernel["enableTDMB"]:
             #TODO: TDM refactor
-            if kernel["NumWaves"] == 1 or self.tdmDealiasAB(kernel):
+            if kernel["NumWaves"] == 1 or self.tdmSeparateABDescriptors(kernel):
               pointerLWCode.addComment1("tdm swap offsets b")
               pointerLWCode.add(self.tdmSwapLdsOffset(kernel, tensorParametersB))
           else:
@@ -5705,7 +5705,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       if kernel["enableTDMB"]:
         #TODO: TDM refactor
-        if kernel["NumWaves"] == 1 or self.tdmDealiasAB(kernel):
+        if kernel["NumWaves"] == 1 or self.tdmSeparateABDescriptors(kernel):
           module.addComment1("TDM swap lds b")
           module.add(self.tdmSwapLdsOffset(kernel, tensorParametersB))
       else:
