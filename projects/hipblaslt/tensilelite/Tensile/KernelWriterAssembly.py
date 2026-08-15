@@ -398,6 +398,31 @@ class KernelWriterAssembly(KernelWriter):
     """
     return self.tdmDealiasAB(kernel) or self.tdmFuseAMx(kernel)
 
+  def tdmDescriptorSetOwner(self, kernel, tc: str) -> str:
+    """The tensor whose name programs the descriptor set that carries `tc`.
+
+    An aliased set is one register set under several tensor names. Anything that
+    mutates a set once per iteration -- the LDS buffer swap above all -- has to
+    act on the owner and skip the aliases: applied under every name it happens
+    once per name, and an even count cancels rather than failing to build.
+
+    The groupings, and who owns each set:
+
+      NumWaves 1   every tensor has its own set and owns it
+      parity       {A,B} and {MXSA,MXSB}, owned by A and MXSA
+      TDMFuse=6    {A}, {B}, {MXSA,MXSB}, owned by A, B and MXSA
+      TDMFuse=2    {A,MXSA,MXSB} and {B}, owned by A and B
+    """
+    if tc not in ("A", "B", "MXSA", "MXSB"):
+      return tc
+    if kernel["NumWaves"] == 1:
+      return tc
+    if self.tdmFuseAMx(kernel):
+      return "B" if tc == "B" else "A"
+    if tc in ("A", "B"):
+      return tc if self.tdmDealiasAB(kernel) else "A"
+    return "MXSA"
+
   def _emitTdmCompId(self, mod, kernel, tc, dstIdx, waveIdxSgpr="WaveIdx"):
     """Leave tensor `tc`'s TDM component id in SGPR `dstIdx`.
 
@@ -7702,7 +7727,7 @@ class KernelWriterAssembly(KernelWriter):
             if kernel["NumWaves"] > 1:
               module.add(SMovB32(dst=sgpr("tdmAGroup0+0"), src=1, comment=""))
               module.add(self.tdmSwapLdsOffset(kernel, tPA))
-              if self.tdmDealiasAB(kernel):
+              if self.tdmSeparateABDescriptors(kernel):
                 # B's descriptor is its own here, so it needs its own re-enable
                 # and its own swap.
                 module.add(SMovB32(dst=sgpr("tdmBGroup0+0"), src=1, comment=""))
@@ -11612,10 +11637,11 @@ class KernelWriterAssembly(KernelWriter):
           imod.middle.add(self.tdmResetTailLdsBuffer(kernel, ldsAddrSgprName))
       # WS mode: this single shared load also serves B (odd waves) via
       # A's aliased SGPRs, so pass iter operands when either tile is iterate.
-      # De-aliased: A's load describes only A, so only A's iterate mode matters,
-      # and it has to be skipped on the waves that carry B.
+      # Once B holds its own set the shared load describes only A (TDMFuse=6) or
+      # A and the scales (TDMFuse=2) and never B, so only A's iterate mode
+      # decides these operands.
       isIterA = kernel.get("_TDMIterateModeA", False)
-      if self.isTdmWaveSeparated(kernel) and not self.tdmDealiasAB(kernel):
+      if self.isTdmWaveSeparated(kernel) and not self.tdmSeparateABDescriptors(kernel):
         isIterA = isIterA or kernel.get("_TDMIterateModeB", False)
       tdmAGroup2 = "tdmAGroup2" if isIterA else None
       tdmAGroup3 = "tdmAGroup3" if isIterA else None
@@ -11682,6 +11708,12 @@ class KernelWriterAssembly(KernelWriter):
       return imod
 
     if tc == "MXSA" and kernel["enableTDMA"]:
+      # TDMFuse=2 folds both scale tensors onto A's descriptor set, so A's single
+      # shared load already moves MXSA on its wave and MXSB on its own. MXSA's
+      # SGPR names are aliases of A's here, so issuing again would fill the shared
+      # set twice rather than fill MXSA.
+      if self.tdmFuseAMx(kernel):
+        return imod
       comp: TensorDataMoverLoad = TensorDataMoverLoad.find(self)
       comp.setMemToken([self.states.ldsTensorTokenIdx])
       if kernel["ProblemType"]["MXBlockA"]:
@@ -11705,16 +11737,22 @@ class KernelWriterAssembly(KernelWriter):
 
     if tc == "B" and kernel["enableTDMB"]:
       # Wave-separated with an aliased descriptor issues one shared load, counted
-      # against A, so B emits nothing here. De-aliased, B has its own descriptor
-      # and therefore its own load.
-      if self.tdmDealiasAB(kernel):
+      # against A, so B emits nothing here. Whenever B holds a descriptor set of its
+      # own it needs its own load -- the structural question, not whether this
+      # particular grouping is the de-aliased one. Which waves issue it does depend
+      # on the grouping: de-aliased splits A against B on parity so only B's waves
+      # issue, while TDMFuse=2 gives every wave a quarter of B so every wave issues.
+      if self.tdmSeparateABDescriptors(kernel):
         comp: TensorDataMoverLoad = TensorDataMoverLoad.find(self)
         comp.setMemToken([self.states.ldsTensorTokenIdx])
         isIterB = kernel.get("_TDMIterateModeB", False)
         tdmBGroup2 = "tdmBGroup2" if isIterB else None
         tdmBGroup3 = "tdmBGroup3" if isIterB else None
-        self._emitTdmDealiasedIssue(imod.middle, kernel, "B", comp,
-                                    "tdmBGroup0", "tdmBGroup1", tdmBGroup2, tdmBGroup3)
+        if self.tdmFuseAMx(kernel):
+          imod.middle.add(comp.issueLoad("tdmBGroup0", "tdmBGroup1", tdmBGroup2, tdmBGroup3))
+        else:
+          self._emitTdmDealiasedIssue(imod.middle, kernel, "B", comp,
+                                      "tdmBGroup0", "tdmBGroup1", tdmBGroup2, tdmBGroup3)
         return imod
       #TODO: TDM refactor, wave separated TDM only issues 1 tensor load
       if numWaves == 1:
@@ -12122,8 +12160,14 @@ class KernelWriterAssembly(KernelWriter):
     """
     tc: str = tP["tensorChar"]
     aliased = kernel["NumWaves"] > 1 and not kernel.get("UseSubtileImpl")
-    if tc in ("A", "B") and self.tdmDealiasAB(kernel):
+    if tc in ("A", "B") and self.tdmSeparateABDescriptors(kernel):
       aliased = False
+    if self.tdmFuseAMx(kernel) and tc == "A":
+      for mx in ("MXSA", "MXSB"):
+        assert self._tdmDecoupledBlocks(kernel, mx)[0] \
+               == self._tdmDecoupledBlocks(kernel, tc)[0], \
+          f"TDMFuse=2: {mx} rides A's descriptor set but carries a different " \
+          f"LDS block count, so the shared set needs a three-way swap arm"
     partner = self._tdmDecoupledAliasPartner.get(tc) if (aliased and kernel["enableTDMB"]) else None
 
     if partner is None:
@@ -12172,6 +12216,10 @@ class KernelWriterAssembly(KernelWriter):
 
     if not needSwap:
       return Module("TDM LDS swap (Empty)")
+
+    owner: str = self.tdmDescriptorSetOwner(kernel, tc)
+    if owner != tc:
+      return Module(f"TDM LDS swap {tc} (aliases {owner}'s set, swapped there)")
 
     comp: TensorDataMoverLoad = TensorDataMoverLoad.find(self)
     ldsAddrSgprName: str = comp.getLdsAddrSgprName(f"tdm{tc}Group0")
@@ -20802,13 +20850,45 @@ class KernelWriterAssembly(KernelWriter):
       # would rebuild A's descriptor on wave 0 alone and B's only on the odd
       # waves. The tail runs in ordinary builds whenever K is not a multiple of
       # DepthU, so this is a correctness path, not a StreamK edge case.
-      with self.allocTmpSgpr(1, tag="resetTDMDescriptorForTailFuseAMx") as tmpRes:
+      with self.allocTmpSgpr(2, tag="resetTDMDescriptorForTailFuseAMx") as tmpRes:
         waveIdxTmp = tmpRes.idx
+        waveOfstTmp = tmpRes.idx + 1
         mod.add(VReadfirstlaneB32(sgpr(waveIdxTmp), vgpr("Serial"), "first tId"))
         mod.add(SLShiftRightB32(sgpr(waveIdxTmp), ceil(log2(kernel["WavefrontSize"])),
                 sgpr(waveIdxTmp), "wId=fTid // wavelen"))
+
+        def resetForTail(tP):
+          """One member's tail reset, with its own component's K offset.
+
+          Same rule as the parity path below: a tensor whose components divide the
+          K extent needs the tail size reduced by the part earlier components take.
+          Derived per tensor from tdmWaveComponents so the three-way dispatch and
+          the parity split answer this from one place.
+          """
+          tcM: str = tP["tensorChar"]
+          m = Module(f"TDM ResetTail {tcM}")
+          numCompM, compShiftM = tdmWaveComponents(kernel, tcM)
+          isMXSM: bool = tcM.startswith("MX")
+          unrolledMajorM = not tP["tlu"]
+          if isMXSM:
+            subM = tcM[3]
+            mxUnitM: int = kernel["MatrixInstK"] // kernel["ProblemType"][f"MXBlock{subM}"]
+            mxDUM = kernel["DepthU"] // kernel["ProblemType"][f"MXBlock{subM}"]
+            mxKSplittingM = (mxDUM // mxUnitM) >= numCompM
+          else:
+            mxKSplittingM = False
+          if not unrolledMajorM or mxKSplittingM:
+            m.add(self.tdmEmitWaveCompId(waveOfstTmp, compShiftM, waveIdxTmp,
+                                         f"wOffset = {tcM} component id"))
+            m.add(SMulI32(sgpr(waveOfstTmp), sgpr(waveOfstTmp), int(du // numCompM),
+                          "wOffset = compId * du // numComp"))
+            m.add(self.resetTDMDescriptorForTail(kernel, tP, waveOfstTmp))
+          else:
+            m.add(self.resetTDMDescriptorForTail(kernel, tP))
+          return m
+
         mod.add(self._tdmFuseAMxDispatch(kernel, tPA, tPB, waveIdxTmp,
-                lambda tP: self.resetTDMDescriptorForTail(kernel, tP), "ResetTail"))
+                resetForTail, "ResetTail"))
       return mod
 
     tdmResetTailLblA = Label(f"TDMResetTail{tcA}", "")
