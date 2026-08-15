@@ -2834,6 +2834,26 @@ class Solution(collections.abc.Mapping):
                  "NumWaves on B), so TDMWaveSpread=%d would name a second, contradictory count "
                  "for the same tensors" % state["TDMWaveSpread"])
           return
+        # The complement of TDMFuse=6's pair guard below: that grouping requires a
+        # divergent pair, this one cannot survive one. MXSB rides A's descriptor
+        # set but is grouped with B for LDS, so a divergent pair puts two block
+        # counts on one shared set and its single swap arm cannot express both.
+        # _tdmSwapLdsOffsetDecoupled asserts the same invariant, but an assert
+        # there is raised inside a codegen worker and aborts the whole
+        # TensileCreateLibrary run; declining here lets the rest of a mixed
+        # matrix build. Compares block counts only, so it does not depend on the
+        # LDS-layout assignment of LdsOffsetBlkA/B, which happens later.
+        decoupled, blkA, blkB = decouplePgrBlocks(state)
+        if decoupled and blkA != blkB:
+          reject(state, printRejectionReason,
+                 "TDMFuse=2 requires an equal decoupled pair: MXSB rides A's descriptor set but "
+                 "follows B's LDS block count, so a divergent pair carries two cadences on the "
+                 "one shared set and its single swap arm cannot express both. The three-way arm "
+                 "is unimplemented rather than impossible -- the hand-written fuseMXA kernel has "
+                 "none to copy, because its cadences are equal. Got PrefetchGlobalReadA=%d and "
+                 "PrefetchGlobalReadB=%d, resolving to %d and %d LDS blocks"
+                 % (state["PrefetchGlobalReadA"], state["PrefetchGlobalReadB"], blkA, blkB))
+          return
         # The guards above are meant to be exactly tdmFuseAMx's preconditions.
         # If they ever drift apart, decline instead of accepting a name the
         # writer will not honour -- a pinned grouping that silently degrades is
