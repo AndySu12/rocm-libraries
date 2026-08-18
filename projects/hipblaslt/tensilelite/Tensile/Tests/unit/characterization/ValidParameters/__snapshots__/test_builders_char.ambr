@@ -1493,6 +1493,7 @@
     'TDMInst',
     'TDMIterateMode',
     'TDMSplit',
+    'TDMWaveSpread',
     'TailloopInNll',
     'TemporalHint',
     'TemporalHintA',
@@ -2663,10 +2664,10 @@
     'TDMFuse': dict({
       'head': list([
         0,
+        2,
         4,
-        6,
       ]),
-      'len': 3,
+      'len': 5,
       'type': 'list',
     }),
     'TDMInst': dict({
@@ -2691,6 +2692,14 @@
       'head': list([
         False,
         True,
+      ]),
+      'len': 2,
+      'type': 'list',
+    }),
+    'TDMWaveSpread': dict({
+      'head': list([
+        0,
+        1,
       ]),
       'len': 2,
       'type': 'list',
