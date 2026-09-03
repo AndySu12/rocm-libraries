@@ -252,6 +252,17 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
 
     mpm.addPass(createFunctionToModuleAdaptor(createAsmMovePropagationPass()));
 
+    // Move propagation rewrites definitions across the whole function, prologue
+    // included, and dropping one leaves an s_cmov_b32 reading a register nothing
+    // defines -- the read-write operand category. Neither existing verifier point
+    // covers it: the one in addGfx1250RegionPasses is scoped to the cloned regions
+    // and runs before its passes, and VerifyEach's observer only reaches the region
+    // and entry pass managers, so the first report lands several passes downstream.
+    // Under VerifyEach, name the pass that did it.
+    if (moduleOptions.VerifyEach) {
+        mpm.addPass(createFunctionToModuleAdaptor(createStinkyIRVerifierPass()));
+    }
+
     // MSB is materialized for the entry function and every callable function
     // (each function owns its VGPR MSB hardware state).
     mpm.addPass(createFunctionToModuleAdaptor(createInsertVgprMsbPass()));

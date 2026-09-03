@@ -69,6 +69,11 @@ static RegType fieldTypeToRegType(FieldType ft) {
 static bool isScalarRegType(RegType type) {
     switch (type) {
         case RegType::S:
+        // m0 is encoded in the scalar operand space, which is why the sreg_m0
+        // field type above maps to RegType::S. Leaving it out made the LDS
+        // clamp every gfx1250 kernel emits (`s_mov_b32 m0, imm`, a SOP1 whose
+        // D0 field is sdst) a permanent type mismatch.
+        case RegType::M:
         case RegType::SCC:
         case RegType::VCC:
         case RegType::VCC_LO:
@@ -294,35 +299,37 @@ std::string validateStinkyIR(Function& func, const AsmVerifierConfig& config) {
         }
     }
 
+    // Accumulate every category. Returning on the first one hid whichever
+    // categories came after it, so a single benign report in an early category
+    // silently suppressed the rest for the whole function.
+    std::stringstream failures;
+
     if (logicalCount > 0) {
-        std::stringstream ss;
-        ss << "StinkyTofu Assembly IR contains " << logicalCount << " Logical instructions. "
-           << "This suggests IR is not fully lowered or mixed.";
-        return ss.str();
+        failures << "StinkyTofu Assembly IR contains " << logicalCount << " Logical instructions. "
+                 << "This suggests IR is not fully lowered or mixed.\n";
     }
 
-    if (stinkyCount == 0) return "Function contains no StinkyTofu instructions (empty IR)";
+    if (stinkyCount == 0) {
+        failures << "Function contains no StinkyTofu instructions (empty IR)\n";
+    }
 
     if (invalidHwDesc > 0) {
-        std::stringstream ss;
-        ss << "Found " << invalidHwDesc << " StinkyTofu instruction(s) with invalid or missing "
-           << "hardware instruction descriptors";
-        return ss.str();
+        failures << "Found " << invalidHwDesc << " StinkyTofu instruction(s) with invalid or "
+                 << "missing hardware instruction descriptors\n";
     }
 
     std::string widthErrorStr = widthErrors.str();
     if (!widthErrorStr.empty()) {
-        std::stringstream ss;
-        ss << "Register width validation failed:\n" << widthErrorStr;
-        return ss.str();
+        failures << "Register width validation failed:\n" << widthErrorStr;
     }
 
     std::string rwErrorStr = rwErrors.str();
     if (!rwErrorStr.empty()) {
-        std::stringstream ss;
-        ss << "Read-write operand validation failed:\n" << rwErrorStr;
-        return ss.str();
+        failures << "Read-write operand validation failed:\n" << rwErrorStr;
     }
+
+    std::string failureStr = failures.str();
+    if (!failureStr.empty()) return failureStr;
 
     if (config.verbose) {
         std::cout << "[StinkyIRVerifier] OK: " << totalBlocks << " blocks, " << stinkyCount
