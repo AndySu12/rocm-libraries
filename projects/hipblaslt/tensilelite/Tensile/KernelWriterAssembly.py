@@ -2254,6 +2254,8 @@ class KernelWriterAssembly(KernelWriter):
         msg = "invalid LSU code due to assertion fail"
       elif self.states.overflowedResources == 8:
         msg = "not enough LDS space"
+      elif self.states.overflowedResources == 9:
+        msg = "no workgroup-wide position for a rebuilt LDS barrier"
       else:
         msg = "unknown"
 

@@ -1,27 +1,5 @@
-################################################################################
-#
-# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-#
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-################################################################################
 """No barrier may be reachable only under a wave-parity guard.
 
 At ScheduleIterAlg=4 (StinkyTofu OptLevel 3) postMainLoopBarrierCheckAndReset
@@ -33,15 +11,11 @@ KernelWriter._dcpScheduleSingleBufferedFillLate and
 KernelWriterAssembly._emitTdmDealiasedIssue. A rebuild that recursed module by
 module could not see that branch, so it put the barrier after it.
 
-The invariant is asserted, not the count. The broken pass emitted exactly the
-right NUMBER of barriers -- three of them in a divergent decoupled-PGR kernel
-were simply executed by half the workgroup -- so a test on the count would have
-passed while gfx1250 silicon returned wrong results. That silicon failure is
-intermittent rather than K-gated: it was observed at K=1024 and K=1152 at DepthU
-256 (b8-3:~/_pgrval19/val.log), and the same defect class failed and then passed
-at the SAME K on one unchanged tree and code object. No K is a safe region and no
-single green run settles anything, which is exactly why this test pins the
-invariant instead of a pass count.
+The invariant is asserted, not the count: a pass can emit exactly the right
+number of barriers and still place one where half the workgroup branches over
+it, which assembles cleanly and returns wrong results on hardware. The resulting
+failures are intermittent rather than tied to any problem size, so a barrier
+count -- or a single green run -- cannot stand in for the invariant.
 
 The last test is the other half of the invariant: a workgroup-uniform branch must
 NOT move a barrier, because the unroll loop is itself skipped by one of those and
@@ -69,12 +43,25 @@ LDS_TOKEN = 0
 
 
 class _Writer:
-    """All the pass reads off the writer is the fallback ScheduleIterAlg, used for a
-    kernel that does not carry the derived one. So it can be run against a
-    hand-built module tree without standing up a whole KernelWriter."""
+    """The pass reads the fallback ScheduleIterAlg, the kernel name, and the
+    overflowedResources flag it sets to decline a solution. That is little enough
+    to run against a hand-built module tree without standing up a whole
+    KernelWriter -- but the flag has to be per-instance, or one refusal would
+    leak into every later test.
+    """
 
-    class states:
-        scheduleIterAlg = 0
+    class _States:
+        def __init__(self):
+            self.scheduleIterAlg = 0
+            self.kernelName = "unit_test_kernel"
+            self.overflowedResources = 0
+
+    class _DebugConfig:
+        printSolutionRejectionReason = False
+
+    def __init__(self):
+        self.states = _Writer._States()
+        self.debugConfig = _Writer._DebugConfig()
 
 
 def _kernel(**overrides):
@@ -94,7 +81,13 @@ def _kernel(**overrides):
 
 
 def _runPass(kernel, root):
-    KernelWriter.postMainLoopBarrierCheckAndReset(_Writer(), kernel, root)
+    writer = _Writer()
+    KernelWriter.postMainLoopBarrierCheckAndReset(writer, kernel, root)
+    return writer
+
+
+# checkResources code for "no workgroup-wide position for a rebuilt LDS barrier".
+_REJECTED = 9
 
 
 def _read():
@@ -323,3 +316,99 @@ def test_a_temporary_reused_after_the_wave_index_is_not_a_wave_index():
     assert [x for x in fillGroup.items() if isinstance(x, SBarrier)], \
         "a barrier was hoisted out of a branch the whole workgroup takes, because " \
         "the register it compares had held a wave index earlier"
+
+
+# Branch targets come from the label object: getLabelName() prefixes the name it
+# was constructed with.
+
+
+def _seq(*leaves):
+    """One module holding the given leaves, so flattened order is written order."""
+    root = Module("kernelBody")
+    for leaf in leaves:
+        root.add(leaf)
+    return root
+
+
+def _branchTo(label, comment):
+    return SCBranchSCC1(labelName=label.getLabelName(), comment=comment)
+
+
+def test_a_token_already_touched_in_the_divergent_region_is_rejected():
+    """The block is read and then refilled inside one divergent region, so
+    hoisting the barrier ahead of the branch would move it ahead of the read it
+    has to separate."""
+    guardEnd = Label("BarrierRejectGuardEnd", "")
+    root = _seq(
+        _fill(),                                        # block written outside
+        _waveParityCompare(),
+        _branchTo(guardEnd, "only one parity falls through"),
+        _read(),                                        # hoists cleanly
+        _fill(),                                        # token already touched inside
+        guardEnd,
+    )
+
+    writer = _runPass(_kernel(), root)
+
+    assert writer.states.overflowedResources == _REJECTED, (
+        "the pass accepted a kernel whose barrier can only be placed where some "
+        "waves branch over it")
+    assert not _barriers(root), "declined, but a barrier was still inserted"
+
+
+def test_a_guard_that_opens_outside_the_loop_is_rejected():
+    """The guard opens outside the loop the access is in, so hoisting there
+    turns a per-iteration barrier into a per-kernel one."""
+    guardEnd = Label("BarrierRejectGuardEnd", "")
+    loopBegin = Label("LoopBeginL", "")
+    root = _seq(
+        _fill(),
+        _waveParityCompare(),
+        _branchTo(guardEnd, "region opens before the loop"),
+        loopBegin,                                      # loop boundary
+        _read(),                                        # transition inside the loop
+        _branchTo(loopBegin, "back-edge"),
+        guardEnd,
+    )
+
+    # PrefetchGlobalRead=2 leaves the back-edge token model empty, isolating the
+    # loop boundary from loop-head token state.
+    writer = _runPass(_kernel(PrefetchGlobalRead=2), root)
+
+    assert writer.states.overflowedResources == _REJECTED, (
+        "a barrier was accepted whose only placement moves it out of the loop it "
+        "has to run in")
+    assert not _barriers(root)
+
+
+def test_a_loop_prologue_barrier_inside_a_divergent_region_is_rejected():
+    """A loop-prologue barrier is pinned to the loop label, so when the label
+    itself sits inside a divergent region it cannot move."""
+    guardEnd = Label("BarrierRejectGuardEnd", "")
+    loopBegin = Label("LoopBeginL", "")
+    root = _seq(
+        _fill(),
+        _waveParityCompare(),
+        _branchTo(guardEnd, "region opens before the loop label"),
+        loopBegin,                                      # prologue barrier belongs here
+        _read(),
+        _branchTo(loopBegin, "back-edge"),
+        guardEnd,
+    )
+
+    # PrefetchGlobalRead=1 turns on the back-edge model that produces a
+    # loop-prologue barrier.
+    writer = _runPass(_kernel(PrefetchGlobalRead=1), root)
+
+    assert writer.states.overflowedResources == _REJECTED
+    assert not _barriers(root)
+
+
+def test_the_successful_hoist_is_still_accepted():
+    root, _guarded, _fillGroup = _guardedFillTree(_waveParityCompare)
+
+    writer = _runPass(_kernel(), root)
+
+    assert writer.states.overflowedResources == 0, \
+        "the production shape was declined, so the refusal is over-conservative"
+    assert len(_barriers(root)) == 1

@@ -19,7 +19,6 @@ from Tensile.Components.TDMFuse import (
     tdmBothTensors,
     tdmFuseAMx,
     tdmFusePaired,
-    tdmWaveCompIdMode,
     tdmWaveComponents,
     tdmWavePartition,
 )
@@ -32,8 +31,11 @@ _TENSORS = ("A", "MXSA", "MXSB", "B")
 _NO_MX_ON_B = {"MacDataTypeB": "F8", "DataTypeMXSB": "E8", "MXBlockB": 0}
 _ONE_WAVE_MI = [16, 16, 128, 1, 1, 2, 16, 1, 1]
 _ONE_WAVE_WG = [32, 1, 1]
+# strict, matching pytest.ini's xfail_strict: TDMSplit is rejected
+# unconditionally today, so these must fail. If it is ever re-enabled they XPASS
+# and strict turns that into a failure, which is the notification we want.
 _TDMSPLIT_DISABLED = pytest.mark.xfail(
-    reason="TDMSplit is currently disabled upstream (PR #10911)", strict=False)
+    reason="TDMSplit is currently disabled upstream (PR #10911)", strict=True)
 
 
 def _ks(fuse=1, pgrA=1, pgrB=2, **overrides):
@@ -104,23 +106,21 @@ def test_paired_holds_at_every_wave_count_parity_can_split(numWaves):
 def test_paired_wave_assignment(tc, waves):
     numComp, got = tdmWavePartition(_ks(), tc)
     assert (numComp, got) == (2, waves)
-    assert tdmWaveCompIdMode(_ks(), tc) == "parity"
     assert tdmWaveComponents(_ks(), tc) == (2, 1)
 
 
 @pytest.mark.parametrize(
-    "tc, numComp, waves, mode, shift",
+    "tc, numComp, waves, shift",
     [
-        ("A", 2, (0, 1), "waveIdx", 0),
-        ("MXSA", 1, (2,), "zero", None),
-        ("MXSB", 1, (3,), "zero", None),
-        ("B", 4, (0, 1, 2, 3), "waveIdx", 0),
+        ("A", 2, (0, 1), 0),
+        ("MXSA", 1, (2,), None),
+        ("MXSB", 1, (3,), None),
+        ("B", 4, (0, 1, 2, 3), 0),
     ],
 )
-def test_amx_wave_assignment(tc, numComp, waves, mode, shift):
+def test_amx_wave_assignment(tc, numComp, waves, shift):
     ks = _ks(fuse=2)
     assert tdmWavePartition(ks, tc) == (numComp, waves)
-    assert tdmWaveCompIdMode(ks, tc) == mode
     assert tdmWaveComponents(ks, tc) == (numComp, shift)
 
 

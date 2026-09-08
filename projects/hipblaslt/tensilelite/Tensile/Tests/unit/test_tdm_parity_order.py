@@ -1,27 +1,5 @@
-################################################################################
-#
-# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-#
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-################################################################################
 """Wave-separated TDM parity must follow the tensor, not the argument position.
 
 The prologue programs the descriptor sets once, always as (A, B), so the A side
@@ -34,9 +12,11 @@ kernel still assembles and every barrier is still in place, which is why only an
 invariant on the helpers catches it.
 
 Both helpers are pure functions of the pair and TDMFuse, so they run unbound
-against a stub -- no toolchain, no rocisa kernel state. No codegen fixture pairs
-with them: the reversed arrival needs a PAP tail loop that no shipping solution
-selects, so calling the helpers directly is the only way to reach it.
+against a stub -- no toolchain, no rocisa kernel state. Reversed arrival is not
+hypothetical: at (PGRA, PGRB) = (1, 2) `_dcpThickThinIssueOrder()` returns
+(B, A) so that the thick tensor issues first, and the StreamK PAP handoff passes
+that pair straight into the tail reset. Calling the helpers directly is simply
+the cheapest way to cover every pair.
 """
 import pytest
 

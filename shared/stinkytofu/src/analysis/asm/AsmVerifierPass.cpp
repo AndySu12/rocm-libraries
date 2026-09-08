@@ -70,9 +70,8 @@ static bool isScalarRegType(RegType type) {
     switch (type) {
         case RegType::S:
         // m0 is encoded in the scalar operand space, which is why the sreg_m0
-        // field type above maps to RegType::S. Leaving it out made the LDS
-        // clamp every gfx1250 kernel emits (`s_mov_b32 m0, imm`, a SOP1 whose
-        // D0 field is sdst) a permanent type mismatch.
+        // field type above maps to RegType::S: `s_mov_b32 m0, imm` is a SOP1
+        // whose D0 field is sdst.
         case RegType::M:
         case RegType::SCC:
         case RegType::VCC:
@@ -299,9 +298,8 @@ std::string validateStinkyIR(Function& func, const AsmVerifierConfig& config) {
         }
     }
 
-    // Accumulate every category. Returning on the first one hid whichever
-    // categories came after it, so a single benign report in an early category
-    // silently suppressed the rest for the whole function.
+    // Accumulate every category: one report must not suppress the others for
+    // the rest of the function.
     std::stringstream failures;
 
     if (logicalCount > 0) {

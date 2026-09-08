@@ -104,18 +104,12 @@ def getKeyNoInternalArgs(state, splitGSU: bool) -> str:
   return key + cof + dn
 
 
-# Should a parameter absent from the solution state still appear in the kernel name?
-#
-# False (current): absent keys are omitted. This keeps legacy kernel names and
-# characterization snapshots unchanged when a parameter is off.
-#
-# True: name every key in getRequiredParametersMin, using _ABSENT_KEY_LEVEL for
-# omitted keys. That renames 51 snapshot files with no assembly change.
+# A parameter absent from the solution state is omitted from the kernel name,
+# which keeps legacy kernel names stable when a parameter is off. Naming absent
+# keys instead (via _ABSENT_KEY_LEVEL) is a snapshot-breaking change.
 #
 # PGRA/PGRB at level 0 must not name the scalar PrefetchGlobalRead: legacy PGR=1
 # and decoupled (1,1) would both read PGRA1_PGRB1 despite different LDS layouts.
-#
-# Flipping _NAME_ABSENT_KEYS requires regenerating characterization snapshots.
 _NAME_ABSENT_KEYS = False
 _ABSENT_KEY_LEVEL = {"PrefetchGlobalReadA": 0, "PrefetchGlobalReadB": 0}
 

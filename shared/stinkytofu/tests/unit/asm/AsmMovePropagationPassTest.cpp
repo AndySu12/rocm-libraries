@@ -82,10 +82,13 @@ class AsmMovePropagationPassTest : public ::testing::Test {
     }
 };
 
-// The TDMFuse=2 shared-set increment: one unconditional mov seeds the register
-// and conditional movs override it on two of the four waves. Propagating into
-// the cmov's tied read made the mov look dead, and waves 0-1 were left reading
-// whatever the register happened to hold.
+// The pre-fix shape of the TDMFuse=2 shared-set increment: a seed s_mov with
+// s_cmov overrides. Propagating into the cmov's tied read makes the seed look
+// dead, leaving the waves that do not take the cmov reading an undefined
+// register -- so the fixture is right to construct this shape even though MX
+// codegen no longer emits it (it emits chained s_cselect and no s_mov/s_cmov
+// for that register, and that absence is correct on MX). This test guards the
+// operand rule, which any opcode with a read-write destination still needs.
 TEST_F(AsmMovePropagationPassTest, TiedCmovReadIsNotPropagatedAndSeedMovSurvives) {
     emit("s_mov_b32", {sgpr(21)}, {sgpr(23)});
     emit("s_cmp_eq_u32", {}, {sgpr(10), sgpr(11)});

@@ -802,6 +802,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
           kept.append(item)
       thick = Module("TDM decoupled early fill set %s" % doubleTc)
       thick.setItems(kept)
+      # Basic-block boundary that keeps the thick fill inside the InitCIterWmma
+      # clone region; past the chain-head boundary the fill loses MFMA overlap.
       thick.add(Label(self.labels.getNameInc("DcpEarlyFill%sEnd" % doubleTc), ""))
       src.setItems([thick])
       self.codes.perIterGlobalRead[lateIter].add(late)
@@ -859,6 +861,18 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if not self._dcpDivergent(kernel):
       return asm
 
+    # TDMFuse=1 needs nothing from this pass: the wait-count insertion pass
+    # already emits its thick gate relaxed, from the disjoint A/B tensor tokens
+    # memTokenLdsDcp assigns.
+    #
+    # Text could not do this job in any case. s_wait_tensorcnt N is an
+    # age-ordered drain on one counter, not a per-tensor mask, so which tensor a
+    # count bypasses follows from issue order alone; and the label the paired
+    # fill emits sits after the fill body, so scanning forward from it leaves
+    # the group entirely and the first wait found belongs to unrelated code.
+    if kernel.get("TDMFuse", 0) == 1:
+      return asm
+
     lines = asm.splitlines(keepends=True)
     _, numLdsBlkA, numLdsBlkB = decouplePGRBlocks(kernel)
     # PGR=2 -> 2 LDS blocks. Hero is B-thick (1,2); mirror is A-thick (2,1).
@@ -869,19 +883,14 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # block it is about to be read from.
     thickTc = "A" if numLdsBlkA == 2 else "B"
     marker = "DcpEarlyFill%s" % thickTc
-    paired = kernel.get("TDMFuse", 0) == 1
-    if paired and not hasattr(self.states, "memTokenLdsDcp"):
-      return asm
-    # Paired descriptors leave only the sibling fill outstanding; separate ones
-    # also leave the double-buffered tensor's own second block.
-    relaxed = 1 if paired else 2
+    # Separate descriptor sets leave the double-buffered tensor's own second
+    # block outstanding as well as the sibling fill.
+    relaxed = 2
 
-    seen = 0
     changed = 0
     for i, line in enumerate(lines):
       if marker not in line or not line.rstrip().endswith(":"):
         continue
-      seen += 1
       for j in range(i + 1, len(lines)):
         candidate = lines[j]
         if (("DcpEarlyFill" in candidate or "DcpLateFill" in candidate)
@@ -898,17 +907,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
                             r"\g<1>%u\2" % relaxed, candidate, count=1)
           changed += 1
         break
-
-    if paired:
-      # A shared descriptor set has its thick gate emitted relaxed already by
-      # the wait-count insertion pass, so changed == 0 is the normal outcome
-      # and only a missing marker means the emitted structure has moved.
-      if not seen:
-        raise RuntimeError(
-            "TDMFuse=1 cannot honour its divergent thick-wait: the thick %s "
-            "fill emitted no %s label (%d/%d LDS blocks)"
-            % (thickTc, marker, numLdsBlkA, numLdsBlkB))
-      return "".join(lines)
 
     # Only InitCIterWmma's iter0 clone adds a second thick fill to retag.
     expected = 2 if kernel.get("InitCIterWmma", 0) == 1 else 1
@@ -11585,7 +11583,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # One entry per wave-divergent region still open, outermost first:
     # [endIdx, branchIdx, ownerModule, indexInOwner, tokensTouchedSinceItOpened].
     openGuards = []
-    divergentBarriers = 0
+    # A barrier only some waves reach is not a workgroup barrier.
+    unsafeBarriers = []
 
     def _crossesLoopBoundary(fromIdx, toIdx):
       return any(fromIdx < b <= toIdx for b in loopBoundaryIndices)
@@ -11612,10 +11611,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
           if prologueBarrierTokens:
             # Prologue barrier must stay at the loop label; do not hoist across guards.
             if openGuards:
-              divergentBarriers += 1
-              print2("[postMainLoopBarrierCheckAndReset] WARNING: the loop prologue barrier for "
-                     "%s is inside a wave-divergent region, so only some waves reach it"
-                     % labelName)
+              unsafeBarriers.append(
+                  (sorted(set(prologueBarrierTokens)),
+                   "the loop prologue barrier for %s has to stay on the loop label, "
+                   "which is inside a wave-divergent region" % labelName))
             plannedBarriers.append((owner, pos, sorted(set(prologueBarrierTokens)),
                                     "auto token transition barrier (loop prologue)"))
         continue
@@ -11675,17 +11674,25 @@ class KernelWriter(metaclass=abc.ABCMeta):
             plannedBarriers.append((outer[2], outer[3], uniqueTokens,
                                     "auto token transition barrier (ahead of a wave-divergent branch)"))
           else:
-            divergentBarriers += 1
-            print2("[postMainLoopBarrierCheckAndReset] WARNING: the barrier for tokens %s cannot "
-                   "leave the wave-divergent region it falls in, because %s; only some waves will "
-                   "reach it" % (uniqueTokens, reason))
-            plannedBarriers.append((owner, pos, uniqueTokens, "auto token transition barrier"))
+            unsafeBarriers.append(
+                (uniqueTokens,
+                 "the barrier for tokens %s cannot leave the wave-divergent region it "
+                 "falls in, because %s" % (uniqueTokens, reason)))
 
       nextState = _accessPhase(access)
       for token in tokens:
         tokenState[token] = nextState
       for guard in openGuards:
         guard[4].update(tokens)
+
+    if unsafeBarriers:
+      # checkResources turns this into a per-solution rejection, not a build failure.
+      self.states.overflowedResources = 9
+      if self.debugConfig.printSolutionRejectionReason:
+        for tokens, why in unsafeBarriers:
+          printWarning("%s: no workgroup-wide position for a rebuilt LDS barrier: %s "
+                       "(LDS tokens %s)" % (self.states.kernelName, why, tokens))
+      return
 
     # Two transitions relocated to the same point want one barrier, not two
     # adjacent ones. plannedBarriers is in program order, so they are adjacent.
@@ -11713,9 +11720,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
       owner.setItems(items)
 
     print2(f"[postMainLoopBarrierCheckAndReset] removed {removedCount} barriers, inserted {insertedCount} barriers")
-    if divergentBarriers:
-      print2(f"[postMainLoopBarrierCheckAndReset] WARNING: {divergentBarriers} inserted barrier(s) "
-             "are reachable only under a wave-divergent branch")
     return
 
   ##############################################################################

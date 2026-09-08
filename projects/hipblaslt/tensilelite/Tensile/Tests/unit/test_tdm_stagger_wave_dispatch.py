@@ -1,27 +1,5 @@
-################################################################################
-#
-# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-#
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-################################################################################
 """TDMFuse=2's stagger gates must dispatch per wave, not by two-way parity.
 
 ``TDMFuse=2`` (``tdmFuseAMx``) aliases ``{A,MXSA,MXSB}`` onto one descriptor set
@@ -29,12 +7,10 @@ and splits them 1/1/2 over four waves: waves 0-1 carry A, wave 2 carries MXSA,
 wave 3 carries MXSB. ``B`` owns its own set and every wave carries a component
 of it.
 
-Every wave-ownership decision in the stagger path used to gate on ``WaveIdx``
-bit 0 and pick the arm with ``"A" in tc``, which is true for ``MXSA`` as well as
-``A``. On one shared descriptor that put A's *and* MXSA's offset on wave 0,
-only MXSB's on wave 1 -- an A wave -- and left B's own descriptor unstaggered on
-the even waves. Only wave 3 was right, and ``removeStagger`` repeated the shape
-with different values, so nothing cancelled.
+A two-way parity gate cannot express that split. Gating on ``WaveIdx`` bit 0 and
+picking the arm with ``"A" in tc`` -- which is true for ``MXSA`` too -- puts A's
+and MXSA's offsets on the same wave and leaves B unstaggered on the even waves,
+and ``removeStagger`` repeats the shape rather than cancelling it.
 
 These tests pin the gate each tensor gets. They run the emitters unbound against
 a stub, because the wave sets are a pure function of the kernel and reaching them

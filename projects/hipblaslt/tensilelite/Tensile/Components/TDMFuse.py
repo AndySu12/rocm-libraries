@@ -1,27 +1,5 @@
-################################################################################
-#
-# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-#
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-################################################################################
 """TDM descriptor grouping (TDMFuse) and the wave partition it selects.
 
 TDMFuse=0  {A,B} + {MXSA,MXSB}   default two-way parity
@@ -87,20 +65,6 @@ def tdmWavePartition(ks, tc):
     numComp = numWaves // 2
     isAArm = tc.endswith("A")
     return numComp, tuple(w for w in range(numWaves) if (w % 2 == 0) == isAArm)
-
-
-def tdmWaveCompIdMode(ks, tc):
-    """Name the formula that turns WaveIdx into this tensor's component id.
-
-    Keys are the shift amount from tdmWaveComponents, not the id itself:
-
-      None  "zero"     id = 0              one wave owns the tensor
-      0     "waveIdx"  id = WaveIdx        consecutive waves 0..numComp-1
-      1     "parity"   id = WaveIdx >> 1   even/odd split; each component
-                                           covers two waves of one parity
-    """
-    _numComp, shift = tdmWaveComponents(ks, tc)
-    return {None: "zero", 0: "waveIdx", 1: "parity"}[shift]
 
 
 def tdmWaveComponents(ks, tc):

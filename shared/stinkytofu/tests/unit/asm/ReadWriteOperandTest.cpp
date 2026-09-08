@@ -84,9 +84,8 @@ class ReadWriteOperandTest : public ::testing::Test {
     }
 
     /// Same, with every category enabled, over a whole list of instructions.
-    std::string verifyAll(
-        const std::vector<std::tuple<std::string, std::vector<StinkyRegister>,
-                                     std::vector<StinkyRegister>>>& insts) {
+    std::string verifyAll(const std::vector<std::tuple<std::string, std::vector<StinkyRegister>,
+                                                       std::vector<StinkyRegister>>>& insts) {
         Function func("test");
         setFunctionArch(func, arch);
         BasicBlock* bb = func.createBasicBlock("entry");

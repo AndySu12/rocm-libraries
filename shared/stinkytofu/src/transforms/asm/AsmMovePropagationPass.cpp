@@ -409,10 +409,6 @@ class AsmMovePropagationPassImpl : public Pass {
                     continue;
                 // Skip a source tied to a read-write destination. It shares the
                 // destination's operand field, so it cannot name another register.
-                // Leaving it alone also keeps the register visibly read here,
-                // which is what lets Phase B's "redefined before any later use"
-                // test see a read it would otherwise miss and wrongly erase the
-                // mov that seeded the register.
                 if (rwDests.covers(oldSrc)) continue;
 
                 StinkyRegister newSrc = resolveMappedSrc(oldSrc);

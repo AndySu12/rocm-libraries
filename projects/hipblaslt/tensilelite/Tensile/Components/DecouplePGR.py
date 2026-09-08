@@ -1,27 +1,5 @@
-################################################################################
-#
-# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-#
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
-################################################################################
 """Per-tensor PrefetchGlobalReadA/B (DecouplePGR).
 
 Both keys must be set or both omitted.
@@ -32,9 +10,9 @@ Both keys must be set or both omitted.
   scalar PGR == -1 (no keys)    auto: start at 2
   (-1, -1) and PGR is 0 or 1    drop A/B, keep that scalar (no auto pair)
   (k, k) for k >= 0             PrefetchGlobalRead=k  (includes (0,0) and (1,1))
+  (-1, k) / (k, -1) for k >= 0  auto over the -1 tensor with the other held at k
   (0, 1) / (1, 0)               reject (both single-buffered)
   one key only                  reject
-  -1 mixed with a real depth    reject
 """
 
 
@@ -208,8 +186,19 @@ def _macroTileFromState(state):
     return None
 
 
-def pgrAutoPairSelectMaxLds(pgr, state, problemType=None):
+def pgrAutoPairSelectMaxLds(pgr, state, problemType=None, fixedA=None, fixedB=None):
+    """Max-LDS feasible pair at or below `pgr`, or None if none fits.
+
+    fixedA / fixedB pin one tensor at a caller-supplied depth. That is how
+    one-sided auto searches: the pinned side is filtered out of the candidate
+    list instead of being searched, so the result still maximises LDS over
+    every combination that remains rather than being decided in advance.
+    """
     candidates = pgrAutoPairCandidates(pgr)
+    if fixedA is not None:
+        candidates = [pair for pair in candidates if pair[0] == fixedA]
+    if fixedB is not None:
+        candidates = [pair for pair in candidates if pair[1] == fixedB]
     if not candidates:
         return None
     macroTile = _macroTileFromState(state)
@@ -244,20 +233,18 @@ def pgrAutoPairSelectMaxLds(pgr, state, problemType=None):
 
 
 def pgrSpecialValueRejectReason(pgrA, pgrB):
-    """Reject one-sided keys, or -1 mixed with a real depth.
+    """Reject one-sided keys.
 
-    (-1, -1) is auto. Equal (k, k) for k >= 0 is left for scalar degeneration.
+    Every both-set combination is left for resolvePrefetchGlobalReadSpecialValues:
+    (-1, -1) searches both tensors, -1 against a real depth searches that one
+    tensor with the other held fixed, and equal (k, k) for k >= 0 degenerates to
+    scalar. A search that finds nothing rejects there, with the LDS reason.
     """
     if pgrA is None and pgrB is None:
         return None
     if (pgrA is None) != (pgrB is None):
         return ("PrefetchGlobalReadA/B: PrefetchGlobalReadA and PrefetchGlobalReadB must "
                 "both be set or both omitted")
-    if pgrA == pgrB:
-        return None
-    if pgrA == PGR_SPECIAL_AUTO or pgrB == PGR_SPECIAL_AUTO:
-        return ("PrefetchGlobalReadA/B: special value %d on one tensor with %d on the "
-                "other is not supported" % (pgrA, pgrB))
     return None
 
 
@@ -267,6 +254,10 @@ def resolvePrefetchGlobalReadSpecialValues(state):
     (-1, -1), or PrefetchGlobalRead=-1 with both keys omitted: pick the
     max-LDS pair starting at PrefetchGlobalRead if it is >= 2, else 2.
     (-1, -1) with PrefetchGlobalRead 0 or 1: drop the keys (no auto pair).
+    -1 on one tensor against a real depth on the other: the same search,
+    narrowed to the combinations that keep the fixed tensor at that depth. The
+    ceiling rises to that depth too, so pinning a level cannot put it out of
+    reach of its own search.
     """
     pgrA = state.get("PrefetchGlobalReadA")
     pgrB = state.get("PrefetchGlobalReadB")
@@ -274,17 +265,34 @@ def resolvePrefetchGlobalReadSpecialValues(state):
     reason = pgrSpecialValueRejectReason(pgrA, pgrB)
     if reason:
         return reason
-    pairAuto = pgrA == PGR_SPECIAL_AUTO and pgrB == PGR_SPECIAL_AUTO
+    autoA = pgrA == PGR_SPECIAL_AUTO
+    autoB = pgrB == PGR_SPECIAL_AUTO
+    pairAuto = autoA and autoB
+    oneSided = autoA != autoB
     scalarAuto = pgrA is None and pgrB is None and pgr == PGR_SPECIAL_AUTO
-    if not (pairAuto or scalarAuto):
+    if not (pairAuto or scalarAuto or oneSided):
         return None
     if pairAuto and pgr in (0, 1):
         state.pop("PrefetchGlobalReadA", None)
         state.pop("PrefetchGlobalReadB", None)
         return None
+    fixedA = fixedB = held = heldTc = None
     start = pgrAutoStartLevel(pgr)
-    selected = pgrAutoPairSelectMaxLds(start, state, state.get("ProblemType"))
+    if oneSided:
+        if autoA:
+            fixedB = held = pgrB
+            heldTc = "B"
+        else:
+            fixedA = held = pgrA
+            heldTc = "A"
+        start = max(start, held)
+    selected = pgrAutoPairSelectMaxLds(start, state, state.get("ProblemType"),
+                                       fixedA=fixedA, fixedB=fixedB)
     if selected is None:
+        if oneSided:
+            return ("PrefetchGlobalReadA/B: auto found no LDS-feasible pair with "
+                    "PrefetchGlobalRead%s held at %d, starting from %d"
+                    % (heldTc, held, start))
         return ("PrefetchGlobalReadA/B: auto found no LDS-feasible pair starting from "
                 "PrefetchGlobalRead=%s" % (pgr if pgr != PGR_SPECIAL_AUTO else start))
     state["PrefetchGlobalReadA"], state["PrefetchGlobalReadB"] = selected

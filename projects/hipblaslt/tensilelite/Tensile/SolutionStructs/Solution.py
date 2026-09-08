@@ -2975,14 +2975,6 @@ class Solution(collections.abc.Mapping):
                  "group, so it requires MX scales on both tensors; without them the group is "
                  "just {A}")
           return
-        # Unreachable while TDMSplit has a blanket reject above.
-        # Kept so this fuse mode has its own reason when TDMSplit is re-enabled.
-        if state.get("TDMSplit"):
-          reject(state, printRejectionReason,
-                 "TDMFuse=2 is not available with TDMSplit, whose multi-wave increment recomputes "
-                 "one parity-selected split stride for one shared descriptor; this grouping "
-                 "retires the parity pairing that select depends on")
-          return
         if state["enableTDMMetadata"]:
           reject(state, printRejectionReason,
                  "TDMFuse=2 does not describe the sparse metadata tensor, which the TDM moves on "

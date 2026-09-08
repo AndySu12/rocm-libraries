@@ -597,7 +597,7 @@ TEST_F(InstructionSizeCostingTest, RealOpcodeWithoutTablegenEncoding_KeepsFourBy
     // The pseudo carve-out must not swallow the defensive default: a *real* opcode whose
     // tablegen entry carries no `.encoding` still occupies at least one 32-bit word.
     auto b = makeBuilder();
-    static const HwInstDesc noEncoding{GFX::s_nop,           GFX::s_nop, 0, 0, 0, 0,
+    static const HwInstDesc noEncoding{GFX::s_nop,           GFX::s_nop,     0, 0, 0, 0,
                                        "s_nop_no_encoding_", makeFlagSet({})};
     StinkyInstruction* inst = b.create(&noEncoding);
     ASSERT_NE(inst, nullptr);
@@ -623,10 +623,9 @@ TEST_F(InstructionSizeCostingTest, Accumulate_FenceCostsNothing) {
 }
 
 TEST_F(InstructionSizeCostingTest, Accumulate_FencesDoNotPadAnAlreadyAlignedLabel) {
-    // Regression for the CheckASMCodeSize gate. TDMFuse=1 emits two WAR SSchedulingFences
-    // just ahead of the 16-byte-aligned unroll-loop label. Charging them 4 B each moved the
-    // cursor to 8 mod 16, so the label got 8 B of padding the assembler never emits and
-    // STINKY_TOTAL_INST_BYTES over-counted the ELF .text section.
+    // Pseudo ops emit no assembly, so they must not move the byte cursor: charging them
+    // 4 B each shifts the cursor's alignment and the following `.align` label is credited
+    // padding the assembler never emits, over-counting the ELF .text section.
     auto b = makeBuilder();
     for (int i = 0; i < 4; ++i) b.create(getMCIDByUOp(GFX::s_nop, arch));  // 16 B: 16-aligned
     b.createFence();
@@ -643,8 +642,8 @@ TEST_F(InstructionSizeCostingTest, Accumulate_FencesDoNotPadAnAlreadyAlignedLabe
 }
 
 TEST_F(InstructionSizeCostingTest, Accumulate_MisalignedLabelStillPadsWithFencesPresent) {
-    // Complement of the regression above: the fix stops pseudo ops from moving the cursor,
-    // it must not disable label alignment. 12 B of code means `.align 16` really owes 4 B.
+    // The complement: pseudo ops not moving the cursor must not disable label alignment
+    // either. 12 B of real code means `.align 16` really does owe 4 B.
     auto b = makeBuilder();
     for (int i = 0; i < 3; ++i) b.create(getMCIDByUOp(GFX::s_nop, arch));  // 12 B
     b.createFence();

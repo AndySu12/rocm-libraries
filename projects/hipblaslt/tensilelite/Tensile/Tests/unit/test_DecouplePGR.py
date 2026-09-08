@@ -177,13 +177,12 @@ def test_pgr_auto_start_level(pgr, start):
 
 
 @pytest.mark.parametrize("pgrA, pgrB, clause", [
-    (-1, 2, "special value"),
-    (-1, 0, "special value"),
     (-1, None, "both be set or both omitted"),
     (0, None, "both be set or both omitted"),
     (1, None, "both be set or both omitted"),
     (2, None, "both be set or both omitted"),
     (None, 2, "both be set or both omitted"),
+    (None, -1, "both be set or both omitted"),
 ])
 def test_pgr_special_value_reject_reason(pgrA, pgrB, clause):
     reason = pgrSpecialValueRejectReason(pgrA, pgrB)
@@ -194,6 +193,17 @@ def test_pgr_special_value_reject_reason(pgrA, pgrB, clause):
     (None, None), (0, 0), (1, 1), (-1, -1), (1, 2), (2, 1), (0, 2), (2, 0), (2, 2),
 ])
 def test_pgr_special_value_accepts_equal_sentinels_and_real_pairs(pgrA, pgrB):
+    assert pgrSpecialValueRejectReason(pgrA, pgrB) is None
+
+
+@pytest.mark.parametrize("pgrA, pgrB", [(-1, 2), (-1, 1), (-1, 0), (2, -1), (1, -1), (0, -1)])
+def test_pgr_special_value_defers_one_sided_auto_to_the_search(pgrA, pgrB):
+    """-1 against a real depth is a constrained search, not a rejection.
+
+    This gate is value-only and cannot see LDS, so it must let the mixed pair
+    through; resolvePrefetchGlobalReadSpecialValues holds the fixed tensor,
+    searches the other, and rejects there only when nothing fits.
+    """
     assert pgrSpecialValueRejectReason(pgrA, pgrB) is None
 
 
@@ -265,6 +275,77 @@ def test_resolve_scalar_auto_starts_at_two():
     state = _autoSelectState(PrefetchGlobalRead=-1)
     assert resolvePrefetchGlobalReadSpecialValues(state) is None
     assert (state["PrefetchGlobalReadA"], state["PrefetchGlobalReadB"]) == (2, 2)
+
+
+# ---------------------------------------------------------------------------
+# One-sided auto: -1 on one tensor, a real depth on the other. PGR, PGRA and
+# PGRB each support -1 independently, so this runs the same max-LDS search
+# narrowed to the pairs that keep the fixed tensor where the caller put it.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("fixedA, fixedB, expected", [
+    (None, 1, (2, 1)),
+    (None, 2, (2, 2)),
+    (1, None, (1, 2)),
+    (2, None, (2, 2)),
+])
+def test_pgr_auto_select_honours_a_pinned_side(fixedA, fixedB, expected):
+    selected = pgrAutoPairSelectMaxLds(2, _autoSelectState(), _F8F4_PROBLEM_TYPE,
+                                       fixedA=fixedA, fixedB=fixedB)
+    assert selected == expected
+
+
+def test_pgr_auto_select_pinned_side_still_ranks_by_lds():
+    assert pgrAutoPairSelectMaxLds(2, _autoSelectState(), _F8F4_PROBLEM_TYPE,
+                                   fixedB=2) == (2, 2)
+    assert pgrAutoPairSelectMaxLds(2, _autoSelectState(MaxLDS=90000), _F8F4_PROBLEM_TYPE,
+                                   fixedB=2) == (1, 2)
+
+
+def test_pgr_auto_select_pinned_side_with_no_candidate_is_none():
+    """No pair in the space keeps a tensor at 0, so the filter empties."""
+    assert pgrAutoPairSelectMaxLds(2, _autoSelectState(), _F8F4_PROBLEM_TYPE,
+                                   fixedB=0) is None
+
+
+@pytest.mark.parametrize("pgrA, pgrB, expected", [
+    (-1, 1, (2, 1)),
+    (1, -1, (1, 2)),
+    (-1, 2, (2, 2)),
+    (2, -1, (2, 2)),
+])
+def test_resolve_one_sided_auto_searches_the_minus_one_side(pgrA, pgrB, expected):
+    state = _autoSelectState(PrefetchGlobalReadA=pgrA, PrefetchGlobalReadB=pgrB)
+    assert resolvePrefetchGlobalReadSpecialValues(state) is None
+    assert (state["PrefetchGlobalReadA"], state["PrefetchGlobalReadB"]) == expected
+
+
+def test_resolve_one_sided_auto_raises_the_ceiling_to_the_pinned_depth():
+    """PrefetchGlobalRead=0 would give an empty candidate space, but pinning
+    B at 2 says level 2 is wanted, so the search has to be able to reach it."""
+    state = _autoSelectState(PrefetchGlobalRead=0, PrefetchGlobalReadA=-1,
+                             PrefetchGlobalReadB=2)
+    assert resolvePrefetchGlobalReadSpecialValues(state) is None
+    assert (state["PrefetchGlobalReadA"], state["PrefetchGlobalReadB"]) == (2, 2)
+
+
+@pytest.mark.parametrize("pgrA, pgrB, heldTc", [(-1, 1, "B"), (1, -1, "A")])
+def test_resolve_one_sided_auto_rejects_when_nothing_fits(pgrA, pgrB, heldTc):
+    """Explicit rejection naming the held side, never a silent fallback."""
+    state = _autoSelectState(MaxLDS=1024, PrefetchGlobalReadA=pgrA,
+                             PrefetchGlobalReadB=pgrB)
+    reason = resolvePrefetchGlobalReadSpecialValues(state)
+    assert reason is not None
+    assert "no LDS-feasible pair" in reason
+    assert "PrefetchGlobalRead%s held at" % heldTc in reason
+
+
+@pytest.mark.parametrize("pgrA, pgrB, expected", [(-1, 1, (True, 2, 1)), (1, -1, (True, 1, 2))])
+def test_one_sided_auto_reaches_decouple_pgr_blocks(pgrA, pgrB, expected):
+    """decouplePGRBlocks reads PrefetchGlobalReadA/B, so the resolved per-tensor
+    depths drive the LDS block counts instead of degenerating to the scalar."""
+    state = _autoSelectState(PrefetchGlobalReadA=pgrA, PrefetchGlobalReadB=pgrB)
+    assert resolvePrefetchGlobalReadSpecialValues(state) is None
+    assert decouplePGRBlocks(state) == expected
 
 
 def _problemType(macA, macB, mxA=0, mxB=0):
@@ -576,7 +657,6 @@ def test_solution_accepts_divergent_pairs(_gp_gfx1250, gfx1250_iim, assembler, c
         ({"PrefetchGlobalRead": 1, "PrefetchGlobalReadA": 1, "PrefetchGlobalReadB": 0},
          "leave both tensors on one LDS block"),
         ({"ScheduleIterAlg": 3}, "only ScheduleIterAlg=0 places the fill where it can be moved"),
-        ({"PrefetchGlobalReadA": -1, "PrefetchGlobalReadB": 2}, "special value"),
     ],
 )
 def test_solution_rejects_unsupported_decoupled_pgr(
@@ -623,6 +703,72 @@ def test_solution_degenerate_zero_falls_back_to_scalar(_gp_gfx1250, gfx1250_iim,
 
 
 # ---------------------------------------------------------------------------
+# Precedence between the legacy scalar and the two per-tensor keys, end to end
+# through Solution derivation. Each of PrefetchGlobalRead, PrefetchGlobalReadA
+# and PrefetchGlobalReadB accepts -1 independently.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("pgrA, pgrB, expected", [(-1, 1, (2, 1)), (1, -1, (1, 2))])
+def test_solution_one_sided_auto_searches_the_constrained_pair(
+        _gp_gfx1250, gfx1250_iim, assembler, capsys, pgrA, pgrB, expected):
+    """One-sided auto holds the fixed tensor and searches the other.
+
+    At this tile the search space for a held side is a single pair, so the
+    assertion is that the fixed depth survives and the -1 side is filled in --
+    not that a wider ranking happened here.
+    """
+    sol, out = _derive(gfx1250_iim, assembler, capsys,
+                       PrefetchGlobalReadA=pgrA, PrefetchGlobalReadB=pgrB)
+    assert sol.get("Valid") is True, out
+    assert (sol.get("PrefetchGlobalReadA"), sol.get("PrefetchGlobalReadB")) == expected
+
+
+@pytest.mark.parametrize("pgrA, pgrB", [(-1, 2), (2, -1)])
+def test_solution_one_sided_auto_can_pick_the_equal_pair_and_degenerate(
+        _gp_gfx1250, gfx1250_iim, assembler, capsys, pgrA, pgrB):
+    """Holding a tensor at 2 leaves (2,2) and the divergent pair; (2,2) wins on
+    LDS, and an equal pair then degenerates to the scalar as it always has."""
+    sol, out = _derive(gfx1250_iim, assembler, capsys,
+                       PrefetchGlobalReadA=pgrA, PrefetchGlobalReadB=pgrB)
+    assert sol.get("Valid") is True, out
+    assert sol.get("PrefetchGlobalRead") == 2
+    assert sol.get("PrefetchGlobalReadA") is None
+    assert sol.get("PrefetchGlobalReadB") is None
+
+
+def test_solution_both_auto_picks_max_lds_pair(_gp_gfx1250, gfx1250_iim, assembler, capsys):
+    """(-1, -1) searches both sides; (2,2) is the max-LDS combination here and
+    then degenerates to the scalar."""
+    sol, out = _derive(gfx1250_iim, assembler, capsys,
+                       PrefetchGlobalReadA=-1, PrefetchGlobalReadB=-1)
+    assert sol.get("Valid") is True, out
+    assert sol.get("PrefetchGlobalRead") == 2
+    assert (sol.get("PrefetchGlobalReadA"), sol.get("PrefetchGlobalReadB")) == (None, None)
+
+
+def test_solution_legacy_scalar_auto_without_per_tensor_keys(
+        _gp_gfx1250, gfx1250_iim, assembler, capsys):
+    """Legacy PrefetchGlobalRead=-1 with no per-tensor keys still resolves."""
+    params = {"PrefetchGlobalRead": -1}
+    params["PrefetchGlobalReadA"] = None
+    params["PrefetchGlobalReadB"] = None
+    sol, out = _derive(gfx1250_iim, assembler, capsys, **params)
+    assert sol.get("Valid") is True, out
+    assert sol.get("PrefetchGlobalRead") == 2
+
+
+@pytest.mark.parametrize("pgrA, pgrB, expected", [(1, 2, (1, 2)), (2, 1, (2, 1))])
+def test_solution_per_tensor_values_win_over_the_legacy_scalar(
+        _gp_gfx1250, gfx1250_iim, assembler, capsys, pgrA, pgrB, expected):
+    """Legacy PrefetchGlobalRead set alongside a per-tensor pair: the pair is
+    what survives derivation, so the scalar cannot silently override it."""
+    sol, out = _derive(gfx1250_iim, assembler, capsys, PrefetchGlobalRead=2,
+                       PrefetchGlobalReadA=pgrA, PrefetchGlobalReadB=pgrB)
+    assert sol.get("Valid") is True, out
+    assert (sol.get("PrefetchGlobalReadA"), sol.get("PrefetchGlobalReadB")) == expected
+    assert decouplePGRBlocks(sol) == (True, expected[0], expected[1])
+
+
+# ---------------------------------------------------------------------------
 # Divergent thick-wait post-pass (KernelWriter._dcpApplyThickWait1).
 # A text pass over already-emitted assembly, so it needs no toolchain: the
 # writer is stubbed down to the two things the pass touches.
@@ -658,15 +804,29 @@ def _thickWaitKernel(pgrA=1, pgrB=2, **overrides):
     return ks
 
 
-def _fillBlock(tc, body=0, wait="s_wait_tensorcnt 0", clone=False):
-    """One emitted fill header: its label, `body` filler lines, then its wait.
+def _fillBlock(tc, body=0, wait="s_wait_tensorcnt 0", clone=False, paired=False):
+    """One emitted fill block, in the layout the arm named by `paired` emits.
+
+    Separate descriptors (`paired=False`) make the label the branch target that
+    skips the fill, so the block reads `[label, body..., wait]` and the wait
+    just after the label really is the thick tensor's own gate.
+
+    TDMFuse=1 (`paired=True`) appends the label *after* the fill body and
+    nothing branches to it, so the block reads `[body..., label]` and holds no
+    wait at all -- whatever a forward scan finds next is outside the group.
+    Generating the non-paired layout for a paired case is what let the paired
+    tests pass against assembly that arm cannot emit, so `wait` is refused here.
 
     `clone` names it the way the InitCIterWmma region clone does.
     """
     name = "label_InitCIterWmma_label_DcpEarlyFill%sEnd_0" % tc if clone \
         else "label_DcpEarlyFill%sEnd" % tc
-    lines = ["%s:" % name]
-    lines += ["  tensor_load_to_lds %d" % i for i in range(body)]
+    fill = ["  tensor_load_to_lds %d" % i for i in range(body)]
+    if paired:
+        assert wait == "s_wait_tensorcnt 0", \
+            "the paired layout carries no wait inside the fill block"
+        return fill + ["%s:" % name]
+    lines = ["%s:" % name] + fill
     if wait is not None:
         lines.append(wait)
     return lines
@@ -739,44 +899,6 @@ def test_thick_wait_shortfall_drops_one_kernel_instead_of_the_build():
         _applyThickWait(_thickWaitKernel(InitCIterWmma=1), asm)
 
 
-def test_thick_wait_paired_retags_both_cloned_headers():
-    asm = _asm(_fillBlock("B", clone=True), _fillBlock("B"))
-    out = _applyThickWait(_thickWaitKernel(TDMFuse=1, InitCIterWmma=1), asm,
-                          memTokenLdsDcp={"A": (0, 1), "B": (2, 3)})
-    assert out.count("s_wait_tensorcnt 1") == 2
-
-
-def test_thick_wait_paired_accepts_a_header_that_shares_a_sibling_wait():
-    """Paired descriptors let one thick fill cover its sibling, so a header
-    with no wait of its own is not a shortfall."""
-    asm = _asm(_fillBlock("B", clone=True), _fillBlock("B", wait=None))
-    out = _applyThickWait(_thickWaitKernel(TDMFuse=1, InitCIterWmma=1), asm,
-                          memTokenLdsDcp={"A": (0, 1), "B": (2, 3)})
-    assert out.count("s_wait_tensorcnt 1") == 1
-
-
-def test_thick_wait_paired_rejects_rather_than_aborts_when_the_fill_is_unlabelled():
-    asm = _asm(_fillBlock("A"), tail=["s_endpgm"])
-    with pytest.raises(RuntimeError, match="emitted no DcpEarlyFillB label"):
-        _applyThickWait(_thickWaitKernel(TDMFuse=1), asm,
-                        memTokenLdsDcp={"A": (0, 1), "B": (2, 3)})
-
-
-def test_thick_wait_paired_accepts_a_gate_the_wait_pass_already_relaxed():
-    """Sharing a descriptor set gets the thick gate emitted as 1 by the
-    wait-count insertion pass, so having nothing left to retag is the normal
-    outcome rather than a shortfall."""
-    asm = _asm(_fillBlock("B", wait="s_wait_tensorcnt 1"))
-    assert _applyThickWait(_thickWaitKernel(TDMFuse=1), asm,
-                           memTokenLdsDcp={"A": (0, 1), "B": (2, 3)}) == asm
-
-
-def test_thick_wait_paired_does_not_tighten_a_wider_gate():
-    asm = _asm(_fillBlock("B", wait="s_wait_tensorcnt 2"))
-    assert _applyThickWait(_thickWaitKernel(TDMFuse=1), asm,
-                           memTokenLdsDcp={"A": (0, 1), "B": (2, 3)}) == asm
-
-
 def test_thick_wait_refuses_to_walk_past_the_thick_gate_to_the_thin_drain():
     """The gate right after the thick fill is the thick tensor's. The next one
     drains the thin tensor's refill into the single block its reads are about
@@ -786,8 +908,55 @@ def test_thick_wait_refuses_to_walk_past_the_thick_gate_to_the_thin_drain():
                tail=["s_wait_tensorcnt 0", "s_endpgm"])
     with pytest.raises(RuntimeError, match="found 0"):
         _applyThickWait(_thickWaitKernel(), asm)
+
+
+# ---------------------------------------------------------------------------
+# TDMFuse=1 is not this pass's business. memTokenLdsDcp gives A and B disjoint
+# tensor tokens, so the wait-count insertion pass computes the relaxed thick
+# gate from dataflow and emits it directly. These pin the no-op against the
+# layout the paired arm actually emits -- `[body..., label]`, label last.
+# ---------------------------------------------------------------------------
+_PAIRED_TOKENS = {"A": (0, 1), "B": (2, 3)}
+
+
+@pytest.mark.parametrize("asmArgs, asmKwargs, tokens", [
+    # the production layout itself
+    (((("B", 8, True),),), {}, _PAIRED_TOKENS),
+    # across the InitCIterWmma region clone and a long fill body
+    (((("B", 400, True, True), ("B", 400, True)),), {}, _PAIRED_TOKENS),
+    # a gate the wait-count insertion pass already emitted as 1, and a wider 2
+    (((("B", 4, True),),), {"tail": ["s_wait_tensorcnt 1", "s_endpgm"]}, _PAIRED_TOKENS),
+    (((("B", 4, True),),), {"tail": ["s_wait_tensorcnt 2", "s_endpgm"]}, _PAIRED_TOKENS),
+    # a thick fill that emitted no label at all
+    (((("A", 0, True),),), {"tail": ["s_endpgm"]}, _PAIRED_TOKENS),
+    # and with no LDS tokens on the writer at all
+    (((("B", 0, True),),), {}, None),
+], ids=["production", "clone+long", "gate1", "gate2", "unlabelled", "no-tokens"])
+def test_thick_wait_paired_is_a_no_op(asmArgs, asmKwargs, tokens):
+    """One branch, so one test. The paired arm returns the assembly untouched
+    before the scan, which makes the token map, the region clone, the body
+    length, the label and any pre-existing gate all the same code path."""
+    blocks = [_fillBlock(tc, body=body, paired=paired,
+                         clone=(rest[0] if rest else False))
+              for (tc, body, paired, *rest) in asmArgs[0]]
+    asm = _asm(*blocks, **asmKwargs)
+    assert _applyThickWait(_thickWaitKernel(TDMFuse=1), asm, memTokenLdsDcp=tokens) == asm
+
+
+def test_thick_wait_paired_leaves_a_downstream_zero_wait_alone():
+    """Regression for the rewrite this pass used to do.
+
+    The paired label is appended after the fill body, so a forward scan is
+    already outside the group and the first wait it meets belongs to unrelated
+    code. Relaxing that one to 1 would let reads start before a real dependency
+    had drained -- a live synchronisation hazard, not a missed optimisation.
+    """
+    asm = _asm(_fillBlock("B", body=8, paired=True),
+               tail=["s_wait_tensorcnt 0", "label_DcpLateFillAEnd:", "s_endpgm"])
     out = _applyThickWait(_thickWaitKernel(TDMFuse=1), asm,
-                          memTokenLdsDcp={"A": (0, 1), "B": (2, 3)})
+                          memTokenLdsDcp=_PAIRED_TOKENS)
+    assert out == asm
+    assert "s_wait_tensorcnt 1" not in out
     assert out.count("s_wait_tensorcnt 0") == 1
 
 
@@ -802,13 +971,56 @@ def test_thick_wait_target_follows_the_label_the_fill_emitted(pgrA, pgrB, thick)
         _applyThickWait(_thickWaitKernel(pgrA, pgrB), asm)
 
 
-def test_thick_wait_paired_without_lds_tokens_is_a_no_op():
-    asm = _asm(_fillBlock("B"))
-    assert _applyThickWait(_thickWaitKernel(TDMFuse=1), asm) == asm
+# ---------------------------------------------------------------------------
+# Thick/thin issue order (KernelWriter._dcpThickThinIssueOrder). Thick-first is
+# what makes the relaxed gate mean anything: s_wait_tensorcnt N is an
+# age-ordered drain on one counter, so which tensor a count bypasses follows
+# from issue order alone. It was guaranteed by construction but asserted
+# nowhere.
+# ---------------------------------------------------------------------------
+def _issueOrder(pgrA, pgrB, *args):
+    from Tensile.KernelWriter import KernelWriter
+
+    writer = _ThickWaitWriter()
+    return KernelWriter._dcpThickThinIssueOrder(
+        writer, _thickWaitKernel(pgrA, pgrB), *args)
 
 
-def test_thick_wait_paired_finds_the_wait_in_a_long_fill_block():
-    asm = _asm(_fillBlock("B", body=400, clone=True), _fillBlock("B", body=400))
-    out = _applyThickWait(_thickWaitKernel(TDMFuse=1, InitCIterWmma=1), asm,
-                          memTokenLdsDcp={"A": (0, 1), "B": (2, 3)})
-    assert out.count("s_wait_tensorcnt 1") == 2
+@pytest.mark.parametrize("pgrA, pgrB, expected", [
+    (1, 2, ("B", "A")),
+    (2, 1, ("A", "B")),
+    (2, 2, ("A", "B")),
+    (1, 1, ("A", "B")),
+])
+def test_dcp_thick_thin_issue_order_puts_the_thick_tensor_first(pgrA, pgrB, expected):
+    assert _issueOrder(pgrA, pgrB) == expected
+
+
+def test_dcp_thick_thin_issue_order_is_a_pure_swap_of_its_arguments():
+    """Call sites pass tensor-parameter objects, not the names "A"/"B", so the
+    helper has to reorder whatever it is handed rather than return literals."""
+    tpA, tpB = object(), object()
+    assert _issueOrder(1, 2, tpA, tpB) == (tpB, tpA)
+    assert _issueOrder(2, 1, tpA, tpB) == (tpA, tpB)
+
+
+@pytest.mark.parametrize("pgrA, pgrB, thick, thin", [(1, 2, "B", "A"), (2, 1, "A", "B")])
+def test_the_ordered_pair_is_the_pair_the_emission_is_gated_on(pgrA, pgrB, thick, thin):
+    """The ordering has to hold in the emitted assembly, not just in the helper.
+
+    Only the thick tensor's early fill carries a DcpEarlyFill label, and that
+    label is what the wait pass finds and relaxes. So asserting which tensor's
+    gate moves proves the emission followed the helper: a site that reverted to
+    a positional A-then-B reading would swap thick and thin, and both arms would
+    fail here. Matching on the source text instead bound this to local-variable
+    spelling and let a semantic break through.
+    """
+    assert _issueOrder(pgrA, pgrB) == (thick, thin)
+
+    relaxed = _applyThickWait(_thickWaitKernel(pgrA, pgrB), _asm(_fillBlock(thick)))
+    assert relaxed.count("s_wait_tensorcnt 2") == 1, \
+        "the thick tensor named by the helper is not the one whose gate was relaxed"
+
+    with pytest.raises(RuntimeError, match="found 0"):
+        _applyThickWait(_thickWaitKernel(pgrA, pgrB),
+                        _asm(_fillBlock(thin), tail=["s_endpgm"]))
