@@ -134,6 +134,7 @@ def getRequiredParametersMin() -> set:
         'TransposeLDS',
         'TransposeLDSMetadata',
         'TDMFuse',
+        'TDMWaveCross',
         'TDMInst',
         "TDMSplit",
         "TDMLoadWaveSync",

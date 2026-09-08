@@ -53,6 +53,7 @@ from .Components.ClusterLoad import ClusterLoadTDM
 from .Components.StreamK import streamKVariantClass
 from .Components.Subtile.Kernel import *
 from .Components.DecouplePGR import decouplePGRBlocks, decoupledSingleBuffered
+from .Components.TDMFuse import tdmWaveIssueOrder
 from .SolutionStructs import Solution, isPackedIndex
 from .SolutionStructs.Utilities import getMiInputType, isSubtileIterateMode
 from .AsmMemoryInstruction import MemoryInstruction
@@ -732,12 +733,17 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self._dcpScheduleSingleBufferedFillLate(kernel)
 
   def _dcpThickThinIssueOrder(self, kernel, tensorParametersA="A", tensorParametersB="B"):
-    if not self._dcpDivergent(kernel):
-      return tensorParametersA, tensorParametersB
-    _, numLdsBlkA, numLdsBlkB = decouplePGRBlocks(kernel)
-    if numLdsBlkA >= numLdsBlkB:
-      return tensorParametersA, tensorParametersB
-    return tensorParametersB, tensorParametersA
+    """(thick, thin) of the pair handed in, as the wave assignment sees it.
+
+    LAYER 3 of the wave-assignment split: tdmWaveAssignment (layer 1) decides
+    which wave issues what, tdmWaveIssueOrder reads it and weighs the two data
+    tensors, and dcpThickThinIssueOrder (layer 2) does the ordering. Nothing
+    here reads TDMWaveCross; only layer 1 does.
+
+    Call sites pass tensor-parameter objects, not the names "A"/"B", so this
+    reorders whatever it is handed rather than returning literals.
+    """
+    return tdmWaveIssueOrder(kernel, tensorParametersA, tensorParametersB)
 
   ##############################################################################
   # Decouple PGR: move a single-buffered tensor's fill to sub-iteration
